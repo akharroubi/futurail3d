@@ -1,6 +1,6 @@
 """The model the plugin runs, declared once.
 
-The entry says where its weights come from (bundled file, download URLs,
+The entry says where its weights come from (download URLs,
 SHA-256), which configuration file describes it, how its class ids map to
 LAS codes, which LAS dimensions and compute devices it needs, and how it is
 licensed. The dock, the Processing algorithm, the model manager and the
@@ -20,8 +20,9 @@ from typing import Callable, Dict, Optional, Tuple
 from ..config import ClassInfo
 
 _CORE_DIR = Path(__file__).resolve().parent
-# Weights published by the plugin author; used only when the bundled copy
-# (weights/ folder of the plugin) is missing or fails its SHA-256 check.
+# Weights published by the plugin author, fetched by Setup or by the first
+# run and SHA-256 verified; a verified copy in the plugin's weights/ folder
+# is used instead when one is there (offline installs).
 _GITHUB_RELEASES = "https://github.com/akharroubi/AerialLidarClassifier/releases/download"
 
 
@@ -57,7 +58,7 @@ class ModelSpec:
 
     @property
     def bundled_weights_path(self) -> Path:
-        """The weights file shipped inside the plugin folder."""
+        """A weights file placed in the plugin folder (offline installs)."""
         return _CORE_DIR.parent / "weights" / self.weights_filename
 
     def supports_device(self, device: str) -> bool:

@@ -7,5 +7,3 @@
   setup of the Python environment, automatic tiling and streaming of large
   files, unit conversion from the file's CRS, a Processing algorithm
   (`rail3d:classify_point_cloud`) and 2D / 3D styling of the results.
-- The model weights ship inside the plugin; nothing is downloaded on first
-  use apart from the Python packages.

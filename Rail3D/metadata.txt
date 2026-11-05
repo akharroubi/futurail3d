@@ -13,7 +13,7 @@ about=Classifies railway corridor LiDAR point clouds (LAS / LAZ / COPC)
     ground (track bed and platforms), rail, pole (catenary masts,
     portals and supports), wire, vegetation, fence and other. Every
     output code is editable; the defaults follow the ASPRS LAS 1.4
-    table where a class exists. The model weights ship with the plugin.
+    table where a class exists.
     A one-click setup installs PyTorch and the LiDAR packages into a
     separate per-user folder on first use (no admin rights). Files in
     feet are converted from their CRS; tiling and streaming handle

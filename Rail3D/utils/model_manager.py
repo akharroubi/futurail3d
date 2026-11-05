@@ -1,7 +1,9 @@
 """Model weight discovery, download, import and cache management.
 
 One ``ModelManager`` per model (``core.registry.ModelSpec``). Weights live
-under the QGIS user profile, ``Rail3D/models/<model id>/``.
+under the QGIS user profile, ``Rail3D/models/<model id>/``, fetched by
+Setup or by the first run (a verified copy in the plugin's ``weights/``
+folder is used instead when one is there, for offline installs).
 Downloads are atomic (write to a temporary file, then rename) so a failure
 never leaves truncated weights on disk, every candidate URL is tried in
 order, and the SHA-256 declared in the registry is verified before the
@@ -144,6 +146,7 @@ class ModelManager:
         expected = (self.spec.weights_sha256 or "").lower().strip()
         if not expected:
             return False, "No released SHA-256 configured for this model."
+        source = "the download server" if "://" in str(origin) else origin
         if expected:
             got = _sha256_of(tmp_path)
             if got != expected:
@@ -152,7 +155,7 @@ class ModelManager:
                 except OSError:
                     _LOG.debug("Ignored non-fatal error", exc_info=True)
                 return False, (
-                    f"SHA-256 mismatch for {origin} (expected "
+                    f"SHA-256 mismatch for {source} (expected "
                     f"{expected[:12]}..., got {got[:12]}...). The file is "
                     "not the released model; it was discarded."
                 )
@@ -164,7 +167,7 @@ class ModelManager:
             tmp_path.unlink(missing_ok=True)
             return False, f"Cannot replace the model file; the previous weights were retained: {exc}"
         size_mb = final_path.stat().st_size / 1e6
-        log_info(f"{self.spec.short_name}: weights ready ({size_mb:.1f} MB) from {origin}")
+        log_info(f"{self.spec.short_name}: weights ready ({size_mb:.1f} MB) from {source}")
         return True, ""
 
     def ensure_available(
@@ -247,8 +250,8 @@ class ModelManager:
                 if cancel_callback is not None and cancel_callback():
                     return False, "Download cancelled."
                 log_info(
-                    f"Downloading {self.spec.short_name} weights, candidate "
-                    f"{idx}/{len(urls)}: {current_url}"
+                    f"Downloading the {self.spec.short_name} weights "
+                    f"(source {idx}/{len(urls)})..."
                 )
                 ok, msg = self._download_one(
                     current_url, tmp_path, progress_callback, cancel_callback)

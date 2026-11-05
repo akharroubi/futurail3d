@@ -77,8 +77,8 @@ class DepsInstallDockWidget(QDockWidget):
             "This is a one-time setup, with nothing to configure. It will:\n"
             "  \u2022 Download a Python runtime (~50 MB)\n"
             "  \u2022 Download a fast package installer (~15 MB)\n"
-            "  \u2022 Install PyTorch + LiDAR packages (about 3 GB)\n\n"
-            "The model weights are included in the plugin.\n"
+            "  \u2022 Install PyTorch + LiDAR packages (about 3 GB)\n"
+            "  \u2022 Download the model (about 170 MB)\n\n"
             "QGIS stays usable while it runs (usually 5 to 15 minutes)."
         )
         welcome_text.setWordWrap(True)

@@ -5,9 +5,11 @@ QGIS 4) on a machine with an NVIDIA GPU and the plugin's environment
 (RAIL3D_CACHE_DIR, else ~/.qgis_rail3d).
 
 Uses the 267,004-point railway reference sample of the maintainer's
-validation folder (RAIL3D_VALIDATION, not redistributed) and the weights
-bundled in the plugin's weights/ folder: nothing is imported or downloaded,
-and the user's QGIS profile is not touched.
+validation folder (RAIL3D_VALIDATION, not redistributed) and the released
+weights: when the standalone QGIS profile of this Python does not hold
+them yet, the local copy (RAIL3D_WEIGHTS, else the maintainer's release
+folder) is imported through the plugin's own import path (SHA-256
+checked). Nothing is downloaded and the user's QGIS profile is not touched.
 
 Checks, for in-memory and streaming modes with custom output codes:
 same point count and order, every source attribute unchanged, the input
@@ -58,13 +60,22 @@ for required in ("rail_reference_input.npy", "rail_reference_predictions.npy"):
                          "(set RAIL3D_VALIDATION to the validation folder)")
 
 manager = manager_module.ModelManager(RAIL)
+weights_imported = False
 if not manager.is_model_available():
-    raise SystemExit(f"The bundled weights are missing or fail their SHA-256 check: "
-                     f"{RAIL.bundled_weights_path}")
+    source = Path(os.environ.get(
+        "RAIL3D_WEIGHTS",
+        r"C:\Users\user\Desktop\QGIS_Plugin\v1.3\model_release\litept_l_rail_5cm_fp16.pth"))
+    ok, message = manager.import_file(source)
+    if not ok:
+        raise SystemExit(f"Could not import the released weights from {source}: {message}")
+    weights_imported = True
 weights_path = manager.get_model_path()
-if weights_path != RAIL.bundled_weights_path or weights_path.parent != ROOT / "weights":
-    raise SystemExit(f"The plugin would not use the bundled weights: {weights_path}")
-print("weights:", weights_path, flush=True)
+if not manager.is_model_available():
+    raise SystemExit(f"The weights are missing or fail their SHA-256 check: {weights_path}")
+if hashlib.sha256(weights_path.read_bytes()).hexdigest() != RAIL.weights_sha256:
+    raise SystemExit(f"The weights the plugin would load are not the released file: {weights_path}")
+print("weights:", weights_path, "(imported now)" if weights_imported else "(already in the profile)",
+      flush=True)
 
 xyz = np.load(ARTIFACTS / "rail_reference_input.npy")
 reference_predictions = np.load(ARTIFACTS / "rail_reference_predictions.npy")
@@ -161,6 +172,7 @@ results["gpu"] = torch.cuda.get_device_name(0)
 results["torch"] = torch.__version__
 results["qgis"] = __import__("qgis.core", fromlist=["Qgis"]).Qgis.version()
 results["weights"] = str(weights_path)
+results["weights_imported"] = weights_imported
 print(json.dumps(results, indent=1), flush=True)
 if agreement < 0.999:
     raise SystemExit(f"agreement with the reference predictions is {agreement:.4%}")

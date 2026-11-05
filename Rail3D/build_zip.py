@@ -6,9 +6,9 @@ The archive holds one top-level folder, ``Rail3D``: the plugin's package
 name (QGIS imports the folder as a Python package, so the name must not
 change between versions or an update installs side by side).
 
-An explicit list of runtime files is packed, plus the model weights in
-``weights/`` (the ZIP is self-contained: nothing is downloaded on first
-use apart from the Python packages). No tests, caches or stray files.
+Only an explicit list of runtime files is packed (no tests, caches,
+weights or stray files): the model weights are fetched by the setup from
+the URL listed in core/registry.py.
 Timestamps are fixed and text files use LF, so the same source gives the
 same files.
 
@@ -26,14 +26,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PACKAGE = "Rail3D"
 DIRS = ("core", "dialogs", "gui", "processing", "utils", "widgets",
-        "workers", "assets", "i18n", "weights")
+        "workers", "assets", "i18n")
 FILES = ("__init__.py", "plugin.py", "config.py", "metadata.txt", "icon.png",
          "LICENSE", "README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md")
-SKIP_SUFFIXES = (".pyc", ".pyo", ".log", ".zip", ".bak")
+SKIP_SUFFIXES = (".pyc", ".pyo", ".pth", ".pt", ".log", ".zip", ".bak")
 TEXT_SUFFIXES = (".py", ".md", ".txt", ".json", ".svg", ".ts", ".ui", ".cfg")
 FIXED_TIME = (2026, 11, 5, 0, 0, 0)
-FORBIDDEN_SUFFIXES = (".exe", ".dll", ".so", ".dylib", ".pyd", ".sh", ".bat", ".cmd",
-                      ".las", ".laz")
+FORBIDDEN_SUFFIXES = (".pt", ".pth", ".ckpt", ".onnx", ".npy", ".npz", ".exe", ".dll",
+                      ".so", ".dylib", ".pyd", ".sh", ".bat", ".cmd", ".las", ".laz")
 
 
 def read_version() -> str:
@@ -60,31 +60,11 @@ def collect():
 _HEX_RUN = re.compile(rb"[0-9a-fA-F]{32,}")
 
 
-def check_weights() -> None:
-    """Every model's bundled weights must be present and match the registry."""
-    weights = sorted((ROOT / "weights").glob("*.pth"))
-    if not weights:
-        raise SystemExit("weights/ holds no .pth file: copy the model weights there first")
-    registry = (ROOT / "core" / "registry.py").read_text(encoding="utf-8")
-    for path in weights:
-        if path.name not in registry:
-            raise SystemExit(f"{path.name} is not declared in core/registry.py")
-        expected = re.search(
-            rf'weights_filename="{re.escape(path.name)}".*?weights_sha256="([0-9a-f]{{64}})"',
-            registry, re.S)
-        if not expected:
-            raise SystemExit(f"No SHA-256 found for {path.name} in core/registry.py")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != expected.group(1):
-            raise SystemExit(f"{path.name}: SHA-256 {digest[:12]}... does not match the registry")
-        print(f"{path.name}: {path.stat().st_size / 1e6:.1f} MB, SHA-256 verified")
-
-
 def check_secrets_scanner(files) -> None:
     """Long hex runs only on lines marked ``pragma: allowlist secret``."""
     problems = []
     for path in files:
-        if path.suffix.lower() in (".png", ".jpg", ".ico", ".pth", ".pt"):
+        if path.suffix.lower() in (".png", ".jpg", ".ico"):
             continue
         for number, line in enumerate(path.read_bytes().splitlines(), 1):
             if _HEX_RUN.search(line) and b"pragma: allowlist secret" not in line:
@@ -159,7 +139,6 @@ def check_flake8_blockers() -> None:
 def build(destination: Path) -> str:
     files = collect()
     check_metadata_parses()
-    check_weights()
     check_no_binaries(files)
     check_secrets_scanner(files)
     check_bandit()

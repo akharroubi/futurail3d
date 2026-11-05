@@ -2,7 +2,8 @@
 
 Run with QGIS's python-qgis-ltr.bat (QGIS 3) or python-qgis.bat (QGIS 4).
 Inference is stubbed (real CUDA inference: the backend unit test and
-qgis_rail_gpu.py). No network, GPU, installed plugin or user settings needed.
+qgis_rail_gpu.py). No network (the weights download is served from a local
+socket or stubbed), no GPU, installed plugin or user settings needed.
 
 The plugin environment is read from RAIL3D_CACHE_DIR when set, else
 ~/.qgis_rail3d (only laspy and numpy are imported from it here).
@@ -28,7 +29,7 @@ import types  # noqa: E402
 import unittest  # noqa: E402
 from contextlib import ExitStack  # noqa: E402
 from dataclasses import replace  # noqa: E402
-from unittest.mock import patch  # noqa: E402
+from unittest.mock import PropertyMock, patch  # noqa: E402
 
 from qgis.PyQt.QtCore import QTimer  # noqa: E402
 
@@ -328,31 +329,160 @@ class RailChecks(unittest.TestCase):
         self.assertEqual(card['weights_bytes'], 171822701)
         self.assertAlmostEqual(card['weights_bytes'] / 1e6, RAIL.weights_size_mb, delta=0.1)
         self.assertNotIn('weights_sha256', card)
-        # One public fallback URL, used only when the bundled file is missing.
+        # The one public URL the first use downloads from (SHA-256 verified).
         self.assertEqual(len(RAIL.weights_urls), 1)
         self.assertTrue(RAIL.weights_urls[0].startswith('https://github.com/akharroubi/'))
         self.assertEqual(RAIL.bundled_weights_path, ROOT / 'weights' / RAIL.weights_filename)
 
-    def test_bundled_weights_are_verified_and_used_without_download(self):
-        bundled = ROOT / 'weights' / RAIL.weights_filename
-        self.assertTrue(bundled.is_file(), bundled)
-        self.assertEqual(bundled.stat().st_size, 171822701)
-        self.assertEqual(hashlib.sha256(bundled.read_bytes()).hexdigest(), RAIL.weights_sha256)
-        manager = manager_module.ModelManager(RAIL)
+    def fresh_profile(self, stack, folder):
+        """Point the model manager at an empty QGIS profile below ``folder``."""
+        profile = Path(folder) / 'profile'
+        profile.mkdir()
+        stack.enter_context(patch.object(
+            manager_module, 'QgsApplication',
+            types.SimpleNamespace(qgisSettingsDirPath=lambda: str(profile) + os.sep)))
+        FakeSettings.store = {}
+        stack.enter_context(patch.object(manager_module, 'QgsSettings', FakeSettings))
+        return profile
+
+    def test_fresh_profile_has_no_weights_and_the_first_run_downloads_them(self):
+        """The plugin folder ships no weights: a new profile starts without
+        them, the first run fetches them from the registry URL (the download
+        itself is stubbed here, no network), and the dock says so."""
         self.assertEqual(manager_module.ModelManager.PLUGIN_FOLDER_NAME, 'Rail3D')
-        self.assertEqual(manager.bundled_path(), bundled)
-        self.assertEqual(manager.get_model_path(), bundled)
-        self.assertEqual(manager.get_model_path().parent, ROOT / 'weights')
-        self.assertTrue(manager.is_model_available())
-        self.assertAlmostEqual(manager.get_model_size_mb(), RAIL.weights_size_mb, delta=0.1)
-        # Already present: no download is attempted, no URL is needed.
-        with patch.object(manager, 'download_model') as download, \
-                patch.object(manager, 'get_candidate_urls', return_value=[]):
-            self.assertEqual(manager.ensure_available(), (True, ''))
-            download.assert_not_called()
+        self.assertFalse(RAIL.bundled_weights_path.exists(),
+                         f'{RAIL.bundled_weights_path}: the plugin no longer ships weights')
         self.assertEqual(config.SETTINGS_PREFIX, 'Rail3D')
         self.assertEqual(config.PLUGIN_NAME, 'Rail 3D')
         self.assertEqual(Path(venv.CACHE_DIR), CACHE_DIR)
+        readiness = module('utils.backend_readiness')
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            profile = self.fresh_profile(stack, folder)
+            manager = manager_module.ModelManager(RAIL)
+            self.assertIsNone(manager.bundled_path())
+            self.assertFalse(manager.is_model_available())
+            cache = profile / 'Rail3D' / 'models' / RAIL.id / RAIL.weights_filename
+            self.assertEqual(manager.get_model_path(), cache)
+            self.assertEqual(manager.get_model_size_mb(), 0.0)
+            self.assertEqual(manager.get_candidate_urls(), [RAIL.weights_urls[0]])
+            self.assertEqual(manager.get_model_url(), RAIL.weights_urls[0])
+            # ensure_available fetches: the transfer is replaced by a stub
+            # that fails, so the message chain is exercised without network.
+            logged = []
+            stack.enter_context(patch.object(manager_module, 'log_info', logged.append))
+            stack.enter_context(patch.object(manager_module, 'log_warning', logged.append))
+            with patch.object(manager_module.ModelManager, '_download_one',
+                              return_value=(False, 'Network error: offline')) as transfer:
+                ok, message = manager.ensure_available(lambda r, t: None, lambda: False)
+                transfer.assert_called_once()
+                self.assertEqual(transfer.call_args.args[0], RAIL.weights_urls[0])
+            self.assertFalse(ok)
+            self.assertIn('Could not get the Rail 3D railway model (5 cm) weights', message)
+            self.assertIn('Network error: offline', message)
+            self.assertIn('Check the internet connection', message)
+            self.assertIn('import the weights file with the folder icon', message)
+            self.assertIn('Rail 3D railway model (5 cm): weights not found locally; downloading '
+                          'them now (about 172 MB, once).', logged)
+            self.assertIn('Downloading the Railway model weights (source 1/1)...', logged)
+            # The log never shows the URL, and no file is left behind.
+            self.assertFalse([m for m in logged if 'http' in m], logged)
+            self.assertEqual([p.name for p in cache.parent.iterdir()], [])
+            # A successful transfer is promoted into the profile cache.
+            payload = b'released railway weights'
+            spec = replace(RAIL, weights_sha256=hashlib.sha256(payload).hexdigest())
+            manager = manager_module.ModelManager(spec)
+
+            def deliver(url, tmp_path, progress_callback=None, cancel_callback=None):
+                tmp_path.write_bytes(payload)
+                return True, ''
+
+            with patch.object(manager_module.ModelManager, '_download_one', side_effect=deliver):
+                self.assertEqual(manager.ensure_available(), (True, ''))
+            self.assertTrue(manager.is_model_available())
+            self.assertEqual(manager.get_model_path(), cache)
+            self.assertEqual(cache.read_bytes(), payload)
+            self.assertEqual([p.name for p in cache.parent.iterdir()], [cache.name])
+            with patch.object(manager, 'download_model') as download:
+                self.assertEqual(manager.ensure_available(), (True, ''))
+                download.assert_not_called()
+            manager.delete_model()
+            self.assertFalse(cache.exists())
+            # The dock in the same fresh profile, with a CUDA GPU and the
+            # libraries ready: not an error, the run downloads first.
+            panel_module = module('gui.main_panel')
+            stack.enter_context(patch.object(panel_module, 'QgsSettings', FakeSettings))
+            stack.enter_context(patch.object(panel_module, 'get_gpu_info', return_value={
+                'available': True, 'backend': 'cuda', 'name': 'Test GPU'}))
+            stack.enter_context(patch.object(readiness, 'litept_dependency_status', return_value=(True, '')))
+            panel = panel_module.ClassifierDockWidget(None)
+            try:
+                self.assertFalse(panel.model_ready)
+                self.assertTrue(panel.model_gate_ok)
+                self.assertIn('Weights download on first run (172 MB)', panel.model_label.text())
+                self.assertIn('download automatically on first use', panel.import_btn.toolTip())
+                self.assertFalse(panel.run_btn.isEnabled())
+                panel.files = [Path(folder) / 'corridor.las']
+                panel.output_widget.setFilePath(folder)
+                panel._update_run_button()
+                self.assertTrue(panel.run_btn.isEnabled())
+                self.assertEqual(panel.run_btn.toolTip(), '')
+                hint = panel.current_file_label.text()
+                self.assertIn('Ready: 1 file(s), Railway classifier on GPU (CUDA).', hint)
+                self.assertIn('Its weights (172 MB) download automatically first.', hint)
+            finally:
+                panel.close()
+            self.assertFalse((profile / 'Rail3D' / 'models' / RAIL.id / RAIL.weights_filename).exists())
+
+    def test_verified_offline_copy_in_the_plugin_weights_folder_is_used(self):
+        """A verified file placed in <plugin>/weights/ (offline installs) is
+        preferred to the profile cache; a wrong file there is ignored."""
+        payload = b'released railway weights'
+        spec = replace(RAIL, weights_sha256=hashlib.sha256(payload).hexdigest())
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            profile = self.fresh_profile(stack, folder)
+            offline = Path(folder) / 'weights' / spec.weights_filename
+            offline.parent.mkdir()
+            stack.enter_context(patch.object(type(spec), 'bundled_weights_path',
+                                             new_callable=PropertyMock, return_value=offline))
+            manager = manager_module.ModelManager(spec)
+            cache = profile / 'Rail3D' / 'models' / spec.id / spec.weights_filename
+            self.assertEqual(spec.bundled_weights_path, offline)
+            self.assertIsNone(manager.bundled_path())
+            self.assertEqual(manager.get_model_path(), cache)
+            # A wrong file in weights/ is not trusted.
+            offline.write_bytes(b'tampered weights')
+            self.assertIsNone(manager.bundled_path())
+            self.assertFalse(manager.is_model_available())
+            self.assertEqual(manager.get_model_path(), cache)
+            # The released file is used in place, with no download.
+            offline.write_bytes(payload)
+            self.assertEqual(manager.bundled_path(), offline)
+            self.assertEqual(manager.get_model_path(), offline)
+            self.assertTrue(manager.is_model_available())
+            self.assertAlmostEqual(manager.get_model_size_mb(), len(payload) / 1e6)
+            with patch.object(manager, 'download_model') as download, \
+                    patch.object(manager, 'get_candidate_urls', return_value=[]):
+                self.assertEqual(manager.ensure_available(), (True, ''))
+                download.assert_not_called()
+            self.assertFalse(cache.exists())
+            # Deleting the cache leaves the offline copy alone.
+            manager.delete_model()
+            self.assertEqual(offline.read_bytes(), payload)
+            self.assertTrue(manager.is_model_available())
+            # The dock reports the copy as ready.
+            panel_module = module('gui.main_panel')
+            stack.enter_context(patch.object(panel_module, 'QgsSettings', FakeSettings))
+            stack.enter_context(patch.object(panel_module, 'get_gpu_info', return_value={'available': False}))
+            classifier = replace(registry.RAILWAY, engines=(spec,))
+            stack.enter_context(patch.object(panel_module, 'get_classifier', lambda _id: classifier))
+            panel = panel_module.ClassifierDockWidget(None)
+            try:
+                self.assertIs(panel._current_spec(), spec)
+                self.assertTrue(panel.model_ready)
+                self.assertNotIn('download', panel.model_label.text())
+                self.assertIn('download automatically on first use', panel.import_btn.toolTip())
+            finally:
+                panel.close()
 
     def test_extra_dimension_descriptions_fit_utf8_byte_limit(self):
         safety = module('utils.output_safety')
@@ -619,7 +749,7 @@ class RailChecks(unittest.TestCase):
         self.assertEqual(resolved, (registry.RAILWAY, (RAIL,)))
 
     # ------------------------------------------------------------------
-    # Weights fallback (bundled file missing)
+    # Weights download (first use) and import
     # ------------------------------------------------------------------
 
     def test_download_ignores_queued_progress_after_feedback_destruction(self):
@@ -678,9 +808,9 @@ class RailChecks(unittest.TestCase):
                 request.downloadProgress.queued_callback(2, 2)
 
     def test_weights_fallback_download_verify_import_and_refuse_bad_files(self):
-        """Without the bundled file: real QGIS network download from a local
-        server into the profile cache, SHA-256 verified, as the registry URL
-        would be used."""
+        """First use: real QGIS network download from a local server into
+        the profile cache, SHA-256 verified, as the registry URL would be
+        used."""
         import http.server
         import threading
         payload = b'released railway weights'

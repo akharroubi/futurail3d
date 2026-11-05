@@ -33,8 +33,8 @@ must start with NVIDIA.
 
 1. Open the **Releases** page of this repository:
    https://github.com/akharroubi/futurail3d/releases
-2. Download the file **Rail_3D_v1.0.0.zip** (about 160 MB). Leave it as a ZIP
-   file, do not unzip it.
+2. Download the file **Rail_3D_v1.0.0.zip**. Leave it as a ZIP file, do not
+   unzip it.
 
 ## 4. Install the plugin in QGIS
 

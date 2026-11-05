@@ -21,19 +21,29 @@ def test_every_model_has_its_bundled_config():
 def test_hashes_and_urls_look_right():
     for spec in registry.MODELS:
         assert re.fullmatch(r"[0-9a-f]{64}", spec.weights_sha256), spec.id
-        # A public fallback URL exists for every model, next to the bundled file.
+        # The weights are fetched at first use: every model has a public URL.
         assert spec.weights_urls and all(u.startswith("https://") for u in spec.weights_urls)
         assert 0 < spec.weights_size_mb < 400
 
 
-def test_bundled_weights_match_the_registry():
+def test_weights_are_not_shipped_and_an_offline_copy_has_a_fixed_place():
+    """The plugin folder carries no weights (they download at first use).
+
+    A verified copy may be placed by hand in weights/ for offline installs;
+    when one is there it must be the released file.
+    """
     for spec in registry.MODELS:
         path = spec.bundled_weights_path
         assert path == PLUGIN_ROOT / "weights" / spec.weights_filename
-        assert path.is_file(), f"{path} missing: copy the weights into the plugin's weights/ folder"
+        if not path.is_file():
+            continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        assert digest == spec.weights_sha256, spec.id
+        assert digest == spec.weights_sha256, f"{path} is not the released file"
         assert round(path.stat().st_size / 1e6, 1) == spec.weights_size_mb
+    # No weights file anywhere in the repository tree that the ZIP could pack.
+    shipped = [p for p in PLUGIN_ROOT.rglob("*") if p.suffix.lower() in (".pth", ".pt", ".ckpt")
+               and "weights" not in p.parts]
+    assert not shipped, shipped
 
 
 def test_class_mappings_are_asprs_codes():
