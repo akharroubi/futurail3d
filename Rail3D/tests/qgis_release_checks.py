@@ -1,0 +1,453 @@
+"""Run with QGIS's Python (python-qgis-ltr.bat on QGIS 3, python-qgis.bat on
+QGIS 4); no network, live settings, or GPU required."""
+import os
+import sys
+from pathlib import Path
+
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+# QGIS first: on QGIS 4 (OSGeo4W) a module that imports ssl before
+# qgis._core (unittest.mock does) loads Python's own OpenSSL, and Qt's
+# network stack then fails to load. Inside QGIS this cannot happen.
+from qgis.core import QgsApplication  # noqa: E402
+app = QgsApplication([], False)
+app.initQgis()
+
+import importlib  # noqa: E402
+import io  # noqa: E402
+import subprocess  # noqa: E402,F401
+import tarfile  # noqa: E402
+import tempfile  # noqa: E402
+import types  # noqa: E402
+import unittest  # noqa: E402
+from contextlib import ExitStack  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT.parent))
+# The plugin's environment (laspy, numpy): RAIL3D_CACHE_DIR when set, as
+# the plugin itself reads it, else the default cache folder.
+CACHE_DIR = Path(os.environ.get('RAIL3D_CACHE_DIR') or Path.home() / '.qgis_rail3d')
+sys.path.append(str(CACHE_DIR / 'venv_py3.12/Lib/site-packages'))
+import laspy
+import numpy as np
+
+def module(name):
+    return importlib.import_module(ROOT.name + '.' + name)
+
+v = module('utils.venv_manager')
+pm = module('utils.python_manager')
+uv = module('utils.uv_manager')
+units = module('utils.las_units')
+streaming = module('workers.streaming_classifier')
+tasks = module('workers.classifier_task')
+spec = module('core.registry').RAIL3D_MODEL
+
+
+class ReleaseChecks(unittest.TestCase):
+    def test_batch_preflight_protects_later_inputs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            a, b = Path(folder) / 'a.las', Path(folder) / 'a_classified.las'
+            a.write_bytes(b'first'); b.write_bytes(b'second')
+            task = tasks.ClassificationTask([a, b], Path(folder), '_classified', spec.id, 'cuda', 'classification')
+            with patch.object(tasks, '_get_torch'), patch.object(tasks, 'create_backend') as backend:
+                self.assertFalse(task.run())
+                backend.assert_not_called()
+            self.assertEqual(b.read_bytes(), b'second')
+            self.assertIn('overwrite an input', task.error_message)
+
+    def test_waveform_payloads_refused_instead_of_lost(self):
+        safety = module('utils.output_safety')
+        h = laspy.LasHeader(point_format=5, version='1.3')
+        h.global_encoding.waveform_data_packets_internal = True
+        with self.assertRaisesRegex(ValueError, 'Waveform'):
+            safety.validate_waveform_storage(h)
+
+    def test_tls_failure_never_retries_insecurely(self):
+        for use_uv in (True, False):
+            calls = []
+            failure = v._PipResult(1, '', 'certificate verify failed')
+            result = v._retry_if_tls_error(failure, ['install'], use_uv, calls.append)
+            self.assertIs(result, failure)
+            self.assertEqual(calls, [])
+            self.assertFalse(v._tls_insecure_fallback_active())
+
+    def test_failed_weight_promotion_retains_good_weights(self):
+        import hashlib
+        manager_module = module('utils.model_manager')
+        with tempfile.TemporaryDirectory() as folder:
+            final, temporary = Path(folder) / 'model.pth', Path(folder) / 'new.part'
+            final.write_bytes(b'old good model'); temporary.write_bytes(b'new good model')
+            manager = object.__new__(manager_module.ModelManager)
+            manager.spec = types.SimpleNamespace(weights_sha256=hashlib.sha256(b'new good model').hexdigest(), short_name='test')
+            with patch.object(manager, '_cache_path', return_value=final), patch.object(Path, 'replace', side_effect=PermissionError('locked')):
+                ok, reason = manager._verify_and_promote(temporary, 'test')
+            self.assertFalse(ok); self.assertIn('retained', reason)
+            self.assertEqual(final.read_bytes(), b'old good model')
+            self.assertFalse(temporary.exists())
+
+    def test_missing_weights_download_automatically_before_the_run(self):
+        # Bundled weights missing or damaged: the run fetches them first.
+        manager_module = module('utils.model_manager')
+        calls = []
+
+        class Backend:
+            def load(self, device): calls.append(('load', device))
+            def predict(self, xyz, cb=None, cancel=None):
+                return np.ones(len(xyz), dtype=np.int32)
+            def unload(self): pass
+
+        def ensure(self, progress=None, cancel=None):
+            calls.append('download')
+            progress(50, 100)
+            return True, ''
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'in.las'
+            h = laspy.LasHeader(point_format=6, version='1.4')
+            d = laspy.LasData(h); d.points = laspy.ScaleAwarePointRecord.zeros(20, header=h)
+            d.X = np.arange(20) * 100; d.write(source)
+            task = tasks.ClassificationTask([source], Path(folder) / 'out', '_c', spec.id, 'cuda', 'classification')
+            with patch.object(tasks, '_get_torch'), \
+                 patch.object(tasks, 'create_backend', return_value=Backend()), \
+                 patch.object(manager_module.ModelManager, 'is_model_available', return_value=False), \
+                 patch.object(manager_module.ModelManager, 'ensure_available', ensure):
+                self.assertTrue(task.run(), task.error_message)
+            self.assertEqual(calls[:2], ['download', ('load', 'cuda')])
+            self.assertEqual(len(task.output_files), 1)
+            self.assertEqual(task.status_text, '')
+
+    def test_weights_download_cancel_and_offline_message(self):
+        manager_module = module('utils.model_manager')
+        manager = manager_module.ModelManager(spec)
+        with patch.object(manager_module.ModelManager, 'is_model_available', return_value=False), \
+             patch.object(manager_module.ModelManager, 'download_model', return_value=(False, 'Download cancelled.')):
+            with self.assertRaises(InterruptedError):
+                manager.ensure_available(None, lambda: True)
+        with patch.object(manager_module.ModelManager, 'is_model_available', return_value=False), \
+             patch.object(manager_module.ModelManager, 'download_model', return_value=(False, 'Network error: offline')):
+            ok, msg = manager.ensure_available(None, lambda: False)
+        self.assertFalse(ok)
+        self.assertIn('Network error: offline', msg)
+        self.assertIn('import the weights file', msg)
+        # Downloaded fine but could not be moved into place: folder advice.
+        with patch.object(manager_module.ModelManager, 'is_model_available', return_value=False), \
+             patch.object(manager_module.ModelManager, 'download_model',
+                          return_value=(False, 'Cannot replace the model file; the previous weights were retained: x')):
+            ok, msg = manager.ensure_available(None, lambda: False)
+        self.assertFalse(ok)
+        self.assertIn('writable', msg)
+        self.assertNotIn('internet', msg)
+        with patch.object(manager_module.ModelManager, 'is_model_available', return_value=True), \
+             patch.object(manager_module.ModelManager, 'download_model') as download:
+            self.assertEqual(manager.ensure_available(), (True, ''))
+            download.assert_not_called()
+
+    def test_installer_subprocesses_do_not_inherit_qgis_python_identity(self):
+        # QGIS 4's launcher sets PYTHONEXECUTABLE; leaked into `python -m
+        # venv` and uv it sent every package into the portable Python.
+        leaked = {'PYTHONEXECUTABLE': r'C:\QGIS\bin\python3.exe', 'PYTHONHOME': r'C:\QGIS\apps\Python312',
+                  'PYTHONPATH': r'C:\QGIS\apps\qgis\python', '__PYVENV_LAUNCHER__': 'x', 'PYTHONSTARTUP': 'y'}
+        with patch.dict(os.environ, leaked):
+            for env in (v._get_clean_env_for_venv(), pm._get_clean_env()):
+                for name in leaked:
+                    self.assertNotIn(name, env)
+
+    def test_setup_guard_only_blocks_the_plugins_own_torch(self):
+        worker = module('workers.deps_install_worker')
+        with tempfile.TemporaryDirectory() as cache:
+            own = types.SimpleNamespace(__file__=str(Path(cache) / 'venv' / 'torch' / '__init__.py'))
+            other = types.SimpleNamespace(__file__=str(Path(cache).parent / 'elsewhere' / 'torch' / '__init__.py'))
+            with patch.dict(sys.modules, {'torch': own}):
+                self.assertTrue(worker._plugin_torch_loaded(cache))
+            with patch.dict(sys.modules, {'torch': other}):
+                self.assertFalse(worker._plugin_torch_loaded(cache))
+
+    def test_installer_commands_require_wheels_and_fail_without_fallback(self):
+        commands = []
+        def run(**kw):
+            commands.append(kw['cmd'])
+            return v._PipResult(1, '', 'certificate verify failed')
+        for gpu in (False, True):
+            commands.clear()
+            with patch.object(v, 'venv_exists', return_value=True), \
+                 patch.object(uv, 'uv_exists', return_value=True), \
+                 patch.object(v, '_get_required_packages', return_value=[('torch', '>=2')]), \
+                 patch.object(v, '_is_cpu_torch_installed', return_value=False), \
+                 patch.object(v, 'detect_nvidia_gpu', return_value=(True, {})), \
+                 patch.object(v, '_select_cuda_index', return_value='cu126'), \
+                 patch.object(v, '_run_pip_install', side_effect=run):
+                self.assertFalse(v.install_dependencies(cuda_enabled=gpu)[0])
+            self.assertTrue(commands)
+            for cmd in commands:
+                self.assertIn('--only-binary=:all:', cmd)
+                self.assertIn('https://download.pytorch.org/whl/' + ('cu126' if gpu else 'cpu'), cmd)
+                self.assertNotIn('--allow-insecure-host', cmd)
+                self.assertNotIn('--trusted-host', cmd)
+
+    def test_cancel_during_verification_never_writes_ready_marker(self):
+        cancelled = False
+        def verify(**kw):
+            nonlocal cancelled
+            cancelled = True
+            return True, 'ok'
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            for obj, name, value in [(v, 'CACHE_DIR', folder), (v, 'VENV_DIR', folder)]:
+                stack.enter_context(patch.object(obj, name, value))
+            for obj, name, value in [(pm, 'standalone_python_exists', True), (uv, 'uv_exists', True),
+                                     (v, 'venv_exists', True), (v, 'cleanup_old_venv_directories', []),
+                                     (v, 'install_dependencies', (True, 'ok'))]:
+                stack.enter_context(patch.object(obj, name, return_value=value))
+            stack.enter_context(patch.object(v, 'verify_venv', side_effect=verify))
+            marker = stack.enter_context(patch.object(v, '_write_install_marker'))
+            result = v.create_venv_and_install(cancel_check=lambda: cancelled)
+            self.assertFalse(result[0]); marker.assert_not_called()
+
+    def test_spconv_failure_is_required_and_gate_explains_repair(self):
+        self.assertFalse(v._is_optional_verify_package('spconv-cu126'))
+        readiness = module('utils.backend_readiness')
+        readiness.litept_dependency_status.cache_clear()
+        with patch.dict(sys.modules, {'spconv': None, 'spconv.pytorch': None}):
+            ready, reason = readiness.litept_dependency_status()
+        readiness.litept_dependency_status.cache_clear()
+        self.assertFalse(ready); self.assertIn('Repair', reason)
+
+    def test_tar_internal_links_and_escape_rejection(self):
+        # Capture extraction to test pre-3.12 fallback on Windows without needing
+        # OS symlink privileges. Actual symlink extraction is covered on Linux.
+        for unsafe in (False, True):
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode='w') as tar:
+                item = tarfile.TarInfo('python/bin/2to3')
+                item.type = tarfile.SYMTYPE
+                item.linkname = '../../../escape' if unsafe else '2to3-3.10'
+                tar.addfile(item)
+            data.seek(0)
+            with tempfile.TemporaryDirectory() as folder, tarfile.open(fileobj=data) as tar:
+                with patch.object(tar, 'extract') as extract:
+                    if unsafe:
+                        with self.assertRaises(ValueError): pm._safe_extract_tar(tar, folder)
+                        extract.assert_not_called()
+                    else:
+                        pm._safe_extract_tar(tar, folder)
+                        self.assertEqual(extract.call_count, 1)
+
+    def test_partial_python_executable_is_not_ready(self):
+        # 1.3.3: standalone_python_exists() checks files only (main thread);
+        # Setup runs the interpreter and downloads it again when it fails
+        # (qgis_review_fix_checks.test_partial_python_is_downloaded_again).
+        with tempfile.TemporaryDirectory() as folder:
+            p = Path(folder) / 'python.exe'; p.write_bytes(b'partial')
+            self.assertFalse(pm.verify_standalone_python(str(p))[0])
+
+    def test_vertical_epsg_and_geographic_override(self):
+        result = units.units_from_geokeys({1024: 1, 3076: 9001, 4096: 6360})
+        self.assertAlmostEqual(result.z_to_m, 1200 / 3937)
+        from laspy.vlrs.known import WktCoordinateSystemVlr
+        h = laspy.LasHeader(point_format=6, version='1.4')
+        h.vlrs.append(WktCoordinateSystemVlr('GEOGCS["WGS 84",UNIT["degree",0.0174532925199433]]'))
+        self.assertTrue(units.resolve_units(h, 'metre').angular)
+
+    def test_provider_headless_registration_is_idempotent(self):
+        plugin = module('plugin').Rail3DPlugin(None)
+        plugin.initProcessing(); first = plugin.provider
+        plugin.initProcessing()
+        self.assertIs(plugin.provider, first)
+        self.assertIsNotNone(QgsApplication.processingRegistry().algorithmById('rail3d:classify_point_cloud'))
+        plugin.unload()
+
+    def test_streaming_and_memory_preserve_raw_attributes_and_evlr(self):
+        from laspy.vlrs.vlrlist import VLRList
+        h = laspy.LasHeader(point_format=8, version='1.4')
+        h.add_extra_dim(laspy.ExtraBytesParams(name='scaled', type='uint64', scales=[.001], offsets=[100]))
+        h.evlrs = VLRList([laspy.VLR(user_id='test', record_id=42, record_data=b'preserve-evlr')])
+        d = laspy.LasData(h); d.points = laspy.ScaleAwarePointRecord.zeros(43, header=h)
+        d.X = np.arange(43) * 100; d.Y = np.arange(43) % 7 * 100
+        d.red = np.arange(43) + 100
+        d.classification = np.full(43, 9, dtype=np.uint8)
+        d.points.array['scaled'] = np.uint64(2**63) + np.arange(43, dtype=np.uint64)
+        def predict(xyz, cb): return np.full(len(xyz), 3, dtype=np.int32)
+        # The model's codes are editable, so the standard classification
+        # field is the only output field: both paths refuse another one.
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'in.las'; d.write(source)
+            original = laspy.read(source)
+            with self.assertRaisesRegex(ValueError, "'classification' field only"):
+                tasks.ClassificationTask([], Path('.'), '_out', spec.id, 'cuda', 'labels')
+            with self.assertRaisesRegex(ValueError, "'classification' field only"):
+                streaming.streaming_tiled_classify(source, Path(folder) / 'x.laz', predict, 'cpu',
+                    spec.class_mapping, laspy, lambda p: None, lambda: False, field_name='labels',
+                    model_spec=spec)
+            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()), ['in.las'])
+            expected = np.full(43, spec.class_mapping[3].asprs_code)
+            for mode in ('stream', 'memory'):
+                output = Path(folder) / (mode + '.laz')
+                if mode == 'stream':
+                    streaming.streaming_tiled_classify(source, output, predict, 'cpu', spec.class_mapping,
+                        laspy, lambda p: None, lambda: False, field_name='classification', tile_auto=False,
+                        tile_size_m=1, buffer_m=0, chunk_size=7, model_spec=spec)
+                else:
+                    task = tasks.ClassificationTask([source], Path(folder), '_out', spec.id, 'cuda',
+                        'classification', tile_enabled=True, tile_auto=False, tile_size_m=1, tile_buffer_m=0)
+                    task._process_one(source, output, predict, laspy, 0, 100)
+                result = laspy.read(output)
+                for name in original.points.array.dtype.names:
+                    if name != 'classification':
+                        np.testing.assert_array_equal(result.points.array[name], original.points.array[name], err_msg=name)
+                np.testing.assert_array_equal(np.asarray(result.classification), expected, err_msg=mode)
+                self.assertEqual(result.evlrs[0].record_data_bytes(), b'preserve-evlr')
+                self.assertTrue(any(v.user_id == 'Rail3D' for v in result.vlrs))
+
+    def test_truncation_and_cancellation_preserve_previous_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder) / 'in.las', Path(folder) / 'out.las'
+            h = laspy.LasHeader(point_format=6, version='1.4')
+            d = laspy.LasData(h); d.points = laspy.ScaleAwarePointRecord.zeros(10, header=h); d.write(source)
+            original = source.read_bytes()
+            output.write_bytes(b'previous output')
+            source.write_bytes(original[:-1])
+            with self.assertRaises(ValueError):
+                streaming.streaming_tiled_classify(source, output, lambda xyz, cb: np.ones(len(xyz), dtype=np.int32),
+                    'cpu', spec.class_mapping, laspy, lambda p: None, lambda: False, chunk_size=3)
+            self.assertEqual(output.read_bytes(), b'previous output')
+            source.write_bytes(original)
+            cancelled = False
+            def progress(p):
+                nonlocal cancelled
+                if p > 90: cancelled = True
+            with self.assertRaises(InterruptedError):
+                streaming._pass4_write(input_path=source, output_path=output,
+                    predictions=np.ones(10, dtype=np.uint8), field_name='classification',
+                    is_asprs_field=True, laspy_module=laspy, progress_callback=progress,
+                    cancel_callback=lambda: cancelled, chunk_size=3, input_pf_id=6)
+            self.assertEqual(output.read_bytes(), b'previous output')
+
+
+    def _dense_corridor_las(self, folder, n_street=240_000, n_background=20_000):
+        """GitHub issue 10 in miniature: a dense street across a sparse area,
+        written in shuffled order (file order is not spatial)."""
+        rng = np.random.default_rng(10)
+        street = np.column_stack([rng.uniform(0, 2_000, n_street), rng.uniform(995, 1_005, n_street),
+                                  rng.uniform(0, 10, n_street)])
+        background = np.column_stack([rng.uniform(0, 2_000, n_background), rng.uniform(0, 2_000, n_background),
+                                      rng.uniform(0, 10, n_background)])
+        xyz = np.vstack([street, background])[rng.permutation(n_street + n_background)]
+        h = laspy.LasHeader(point_format=6, version='1.4')
+        h.scales = [0.001, 0.001, 0.001]
+        h.offsets = [0, 0, 0]
+        d = laspy.LasData(h)
+        d.x, d.y, d.z = xyz.T
+        source = Path(folder) / 'corridor.las'
+        d.write(source)
+        return source, laspy.read(source)
+
+    @staticmethod
+    def _position_labels(xyz):
+        """A label that depends only on the point, not on the tile it came in."""
+        return (np.floor(xyz[:, 0] / 37.0).astype(np.int64) % 7 + 1).astype(np.int32)
+
+    def test_dense_tiles_are_split_to_the_memory_budget_streaming_and_memory(self):
+        """Every predict call stays within the point budget (the buffer allows
+        it here), every point is labelled once, from its own position."""
+        memory = module('core.memory')
+        with tempfile.TemporaryDirectory() as folder:
+            source, original = self._dense_corridor_las(folder)
+            expected_ids = self._position_labels(np.column_stack([original.x, original.y, original.z]))
+            expected = np.array([spec.class_mapping[int(i)].asprs_code for i in expected_ids])
+            budget = 40_000
+            for mode in ('stream', 'memory'):
+                calls = []
+
+                def predict(xyz, cb):
+                    calls.append(len(xyz))
+                    return self._position_labels(xyz)
+                output = Path(folder) / 'results' / (mode + '.las')
+                messages = []
+                workdirs = []
+                real_mkdtemp = streaming.tempfile.mkdtemp
+
+                def mkdtemp(*args, **kwargs):
+                    workdirs.append(Path(real_mkdtemp(*args, **kwargs)))
+                    return str(workdirs[-1])
+                with patch.dict(os.environ, {memory.ENV_TILE_POINTS: str(budget)}),                         patch.object(streaming, 'log_info', messages.append),                         patch.object(tasks, 'log_info', messages.append),                         patch.object(streaming.tempfile, 'mkdtemp', mkdtemp):
+                    if mode == 'stream':
+                        streaming.streaming_tiled_classify(
+                            source, output, predict, 'cpu', spec.class_mapping, laspy,
+                            lambda p: None, lambda: False, tile_auto=True, buffer_m=10,
+                            chunk_size=50_000, model_spec=spec)
+                    else:
+                        output.parent.mkdir(exist_ok=True)
+                        task = tasks.ClassificationTask([source], Path(folder), '_m', spec.id, 'cpu',
+                                                        'classification', tile_enabled=True,
+                                                        tile_auto=True, tile_buffer_m=10)
+                        task._process_one(source, output, predict, laspy, 0, 100)
+                self.assertTrue(any('dense tile(s) split' in m for m in messages), (mode, messages))
+                if mode == 'stream':
+                    # Temporary tile files next to the output, never in the
+                    # system temporary folder, and removed afterwards.
+                    self.assertEqual([w.parent for w in workdirs], [output.parent])
+                    self.assertFalse(workdirs[0].exists())
+                    self.assertEqual(sorted(p.name for p in output.parent.iterdir()), ['stream.las'])
+                self.assertLessEqual(max(calls), budget, mode)
+                result = laspy.read(output)
+                self.assertEqual(len(result.points), len(original.points))
+                np.testing.assert_array_equal(np.asarray(result.classification), expected, err_msg=mode)
+                np.testing.assert_array_equal(result.X, original.X)
+
+    def test_file_larger_than_free_memory_is_streamed_without_the_option(self):
+        """Tiling and streaming are one option: with streaming not requested,
+        a file that does not fit in the free memory is streamed (dock task and
+        Processing), and one that fits stays in memory."""
+        memory = module('core.memory')
+        algorithm_module = module('processing.classify_algorithm')
+        with tempfile.TemporaryDirectory() as folder:
+            source, original = self._dense_corridor_las(folder, 60_000, 2_000)
+            expected = np.array([spec.class_mapping[int(i)].asprs_code for i in
+                                 self._position_labels(np.column_stack([original.x, original.y, original.z]))])
+            for available, expected_mode in ((10 ** 6, 'streaming'), (64 * 1024 ** 3, 'tiled')):
+                messages = []
+                streamed = []
+                real_stream = streaming.streaming_tiled_classify
+
+                def spy(*args, **kwargs):
+                    streamed.append(True)
+                    return real_stream(*args, **kwargs)
+                with patch.object(memory, 'available_memory_bytes', return_value=available), \
+                        patch.object(streaming, 'streaming_tiled_classify', spy), \
+                        patch.object(tasks, 'log_info', messages.append):
+                    output = Path(folder) / f'{expected_mode}_task.las'
+                    task = tasks.ClassificationTask([source], Path(folder), '_t', spec.id, 'cpu',
+                                                    'classification', tile_enabled=True, tile_auto=True,
+                                                    tile_buffer_m=10)
+                    task._process_one(source, output, lambda xyz, cb: self._position_labels(xyz),
+                                      laspy, 0, 100)
+                self.assertEqual(bool(streamed), expected_mode == 'streaming', expected_mode)
+                self.assertEqual(any('streaming the file from disk automatically' in m for m in messages),
+                                 expected_mode == 'streaming')
+                np.testing.assert_array_equal(np.asarray(laspy.read(output).classification), expected)
+            # Processing decides the same way from the same header.
+            with patch.object(memory, 'available_memory_bytes', return_value=10 ** 6):
+                mode, reason = algorithm_module.plan_processing(len(original.points), 30, True)
+            self.assertEqual(mode, 'streaming')
+
+    def test_streaming_refuses_a_temp_folder_that_cannot_hold_the_sidecars(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, _ = self._dense_corridor_las(folder, 20_000, 1_000)
+            output = Path(folder) / 'out.las'
+            full = types.SimpleNamespace(total=10 ** 12, used=10 ** 12, free=100_000)
+            with patch.object(streaming.shutil, 'disk_usage', return_value=full):
+                with self.assertRaisesRegex(RuntimeError, 'Not enough free space'):
+                    streaming.streaming_tiled_classify(
+                        source, output, lambda xyz, cb: np.ones(len(xyz), dtype=np.int32), 'cpu',
+                        spec.class_mapping, laspy, lambda p: None, lambda: False, model_spec=spec)
+            self.assertFalse(output.exists())
+            warnings = []
+            # Just above the minimum: 32 bytes per point and one sidecar's overhead.
+            tight = types.SimpleNamespace(total=10 ** 12, used=10 ** 12,
+                                          free=21_000 * 32 + streaming.SIDECAR_FILE_OVERHEAD + 10)
+            with patch.object(streaming.shutil, 'disk_usage', return_value=tight):
+                streaming._check_temp_space(Path(folder), 21_000, [(0, 0, 100, 100)], 50.0, warnings.append)
+            self.assertTrue(warnings and 'may need up to' in warnings[0])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

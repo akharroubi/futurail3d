@@ -1,0 +1,4367 @@
+"""Virtual environment manager for the Rail 3D plugin.
+
+Manages the creation, package installation, and verification of an
+isolated per-user virtual environment that holds the plugin's
+Python dependencies (PyTorch, laspy, ...). Keeping them out of
+QGIS's own Python avoids version conflicts.
+"""
+
+import contextlib
+import hashlib
+import os
+import platform
+import re
+import shutil
+import sys
+import tempfile
+import time
+from typing import Callable, List, Optional, Tuple
+
+from qgis.core import Qgis, QgsMessageLog
+
+from . import proc
+from ..config import PLUGIN_NAME
+import logging
+
+_LOG = logging.getLogger(__name__)
+
+PYTHON_VERSION = f"py{sys.version_info.major}.{sys.version_info.minor}"
+CACHE_DIR = (
+    os.environ.get("RAIL3D_CACHE_DIR")
+    or os.environ.get("RAIL3D_VENV_DIR")
+    or os.path.expanduser("~/.qgis_rail3d")
+)
+VENV_DIR = os.path.join(CACHE_DIR, f"venv_{PYTHON_VERSION}")
+
+REQUIRED_PACKAGES = [
+    # PyTorch + torchvision: pinned to the 2.x series to avoid the
+    # 3.0 API break, and below the bleeding edge that may not have a
+    # matching CUDA wheel on every release day.
+    ("torch", ">=2.0.0,<3.0.0"),
+    ("torchvision", ">=0.15.0"),
+    # LAS / LAZ I/O. lazrs is laspy's parallel LAZ backend.
+    ("laspy", ">=2.4.0"),
+    ("lazrs", ">=0.6.0"),
+    # Kept for environment compatibility with the author's other plugin.
+    ("timm", ">=0.9.0"),
+    ("numpy_indexed", ">=0.3.7"),
+    # NumPy 2 provides wheels for newer Python; verify imports before readiness.
+    ("numpy", ">=1.26,<3"),
+    # KD-tree crops for the LitePT-L model (pure wheels on every OS).
+    ("scipy", ">=1.10"),
+    # NOTE: no 'requests' here - the model downloader uses
+    # QgsBlockingNetworkRequest so the QGIS proxy / auth settings are
+    # respected (per the QGIS plugin guidelines).
+]
+
+# spconv (sparse convolutions for LitePT-L) is a CUDA-only compiled
+# package published as one distribution per CUDA toolkit. These indexes
+# have a matching build; it is installed after torch (Phase C).
+# No wheel exists for cu128, which is why the cascade below prefers cu126
+# on non-Blackwell GPUs. Blackwell GPUs (RTX 50 series) need the cu128
+# torch; they get spconv's cu126 build, whose embedded PTX the NVIDIA
+# driver compiles for the GPU on first use (verified at 12.6 on a cu128
+# torch: the wheel links cudart64_12 / nvrtc64_120_0, both shipped by
+# every CUDA 12 torch wheel).
+_SPCONV_INDEXES = ("cu118", "cu121", "cu124", "cu126")
+_SPCONV_FALLBACK_BUILDS = {"cu128": "cu126"}
+
+DEPS_HASH_FILE = os.path.join(VENV_DIR, "deps_hash.txt")
+CUDA_FLAG_FILE = os.path.join(VENV_DIR, "cuda_installed.txt")
+
+# Bump when install logic changes significantly to force re-install.
+_INSTALL_LOGIC_VERSION = "9"
+
+# Bump independently for CUDA-specific install logic changes.
+_CUDA_LOGIC_VERSION = "1"
+
+# Install-pipeline schema version. Bump this any time we change how
+# the venv is created or what's installed in it, so the install marker
+# check in `get_venv_status` triggers a clean reinstall for users
+# upgrading from a plugin version with an older pipeline. Plugin
+# version bumps WITHOUT install-pipeline changes should NOT bump this
+# (otherwise every minor update would force users to reinstall 1-3 GB
+# of dependencies for no benefit).
+#
+# Schema 2 (v1.0.1):
+#   - venv created with `--without-pip`
+#   - CUDA cascade cu128 -> cu118
+#   - torch version cap per cuda index
+# Schema 3 (v1.1.0):
+#   - scipy always, spconv-<cuXXX> on CUDA installs (LitePT-L model)
+#   - cu126 preferred over cu128 on non-Blackwell GPUs (spconv wheels)
+#   - torch pinned by a constraints file for every later install
+#   - certificate verification on by default (TLS retry only on failure)
+_INSTALL_SCHEMA_VERSION = "4"
+
+# Minimum NVIDIA driver versions for each CUDA toolkit version.
+# Windows-side thresholds; Linux thresholds are slightly lower but the
+# numbers used here also cover Linux safely. cu118 is the floor: it
+# works on driver 452+ which covers Pascal-era / pre-2021 systems.
+_CUDA_DRIVER_REQUIREMENTS = {
+    "cu128": 570,
+    "cu126": 560,
+    "cu124": 550,
+    "cu121": 530,
+    "cu118": 452,
+}
+
+# PyTorch periodically drops CUDA toolkit support in new torch versions
+# but keeps publishing +cpu wheels at the old URLs as a fallback. If we
+# install with --index-url https://download.pytorch.org/whl/cu121 and
+# torch>=2.0.0,<3.0.0, uv happily picks the latest version number it
+# can see (e.g. torch 2.12.0+cpu) instead of the latest +cu121 wheel
+# (e.g. torch 2.5.1+cu121). The cap below is the exclusive upper bound
+# we apply for each cuda_index so the resolver lands on a wheel that
+# actually has the +cu121 (etc.) local-version tag.
+#
+# Even cu126 / cu128 (the current production targets) need a cap when
+# PyTorch lags publishing +cuXXX wheels for the very latest torch
+# release. Observed in May 2026: torch 2.12.0 has +cu126 wheels but
+# NOT +cu128 wheels, so cu128 callers would silently get 2.12.0+cpu.
+# Caps are bumped when PyTorch ships +cuXXX wheels for a newer torch.
+_TORCH_VERSION_CAP_BY_CUDA = {
+    "cu118": "2.6",
+    "cu121": "2.6",
+    "cu124": "2.8",
+    # cu126: torch 2.14.0+cu126 exists and was verified with spconv-cu126
+    # 2.3.8 and both models on 2026-09-25.
+    "cu126": "2.15",
+    # cu128: latest +cu128 wheel as of May 2026 is for torch 2.11.x.
+    # Bump when newer +cu128 wheels are published.
+    "cu128": "2.12",
+}
+
+# Blackwell requires cu128: compute capability 10.x (B200, GB200, GB300) and
+# 12.x (RTX 50 series). The cu126 wheels stop at Hopper (sm_90) and ship no
+# PTX, so they cannot run on these GPUs at all.
+# On Windows, prefer cu126 for broader compatibility with newer packages
+# (e.g., sam3) when the driver supports it; otherwise fall back to cu124.
+_MIN_COMPUTE_CAP_FOR_CU128 = 10.0
+
+# Cache for detect_nvidia_gpu() â€” avoids re-running nvidia-smi.
+_gpu_detect_cache = None  # type: Optional[Tuple[bool, dict]]
+# Seconds nvidia-smi gets to answer: a laptop GPU in its power-saving
+# state can take several seconds to wake up.
+_NVIDIA_SMI_TIMEOUT = 20
+
+
+def _log(message: str, level=Qgis.MessageLevel.Info):
+    """Log a message to the QGIS message log.
+
+    Args:
+        message: The message to log.
+        level: The log level (default: Qgis.MessageLevel.Info).
+    """
+    QgsMessageLog.logMessage(message, PLUGIN_NAME, level=level)
+
+
+def _log_system_info():
+    """Log system information for debugging installation issues."""
+    try:
+        qgis_version = Qgis.QGIS_VERSION
+    except Exception:
+        qgis_version = "Unknown"
+
+    # Keep every f-string on one line: a line break inside ``{...}`` of a
+    # single-quoted f-string is Python 3.12+ syntax (PEP 701) and made
+    # this module fail to import on the Python 3.9-3.11 QGIS builds.
+    info_lines = [
+        "=" * 50,
+        "Installation Environment:",
+        f"  OS: {sys.platform} ({platform.system()} {platform.release()})",
+        f"  Architecture: {platform.machine()}",
+        f"  Python: {sys.version_info.major}.{sys.version_info.minor}."
+        f"{sys.version_info.micro}",
+        f"  QGIS: {qgis_version}",
+    ]
+    if os.environ.get("RAIL3D_CACHE_DIR"):
+        info_lines.append(
+            "  RAIL3D_CACHE_DIR: "
+            + os.environ["RAIL3D_CACHE_DIR"])
+    elif os.environ.get("RAIL3D_VENV_DIR"):
+        info_lines.append(
+            "  RAIL3D_VENV_DIR: "
+            + os.environ["RAIL3D_VENV_DIR"])
+    info_lines.append(f"  Cache directory: {CACHE_DIR}")
+    info_lines.append("=" * 50)
+    for line in info_lines:
+        _log(line, Qgis.MessageLevel.Info)
+
+
+def _check_rosetta_warning() -> Optional[str]:
+    """Detect if running under Rosetta on macOS ARM.
+
+    Returns:
+        Warning message if Rosetta detected, None otherwise.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    machine = platform.machine()
+    if machine == "x86_64":
+        try:
+            result = proc.run(
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                timeout=5,
+            )
+            if "Apple" in result.stdout:
+                return (
+                    "Warning: QGIS is running under Rosetta (x86_64 emulation) "
+                    "on Apple Silicon. This may cause compatibility issues. "
+                    "Consider using the native ARM64 version of QGIS.")
+        except Exception:
+            _LOG.debug("Ignored non-fatal error", exc_info=True)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CUDA flag persistence
+# ---------------------------------------------------------------------------
+
+
+def _write_cuda_flag(value: str):
+    """Persist CUDA install state.
+
+    Args:
+        value: One of 'cuda', 'cpu', or 'cuda_fallback'.
+    """
+    if value == "cuda_fallback":
+        content = f"cuda_fallback:{_CUDA_LOGIC_VERSION}"
+    else:
+        content = value
+    try:
+        os.makedirs(os.path.dirname(CUDA_FLAG_FILE), exist_ok=True)
+        with open(CUDA_FLAG_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+    except (OSError, IOError) as e:
+        _log(f"Failed to write CUDA flag: {e}", Qgis.MessageLevel.Warning)
+
+
+def _read_cuda_flag() -> Optional[str]:
+    """Read CUDA install state.
+
+    Returns:
+        One of 'cuda', 'cpu', 'cuda_fallback', or None.
+    """
+    try:
+        with open(CUDA_FLAG_FILE, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+        base = value.split(":")[0]
+        if base in ("cuda", "cpu", "cuda_fallback"):
+            return base
+    except (OSError, IOError):
+        _LOG.debug("Ignored non-fatal error", exc_info=True)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dependency hash tracking
+# ---------------------------------------------------------------------------
+
+
+def _compute_deps_hash() -> str:
+    """Compute MD5 hash of REQUIRED_PACKAGES + install logic version.
+
+    Returns:
+        Hex digest string.
+    """
+    data = repr(_get_required_packages()).encode("utf-8")
+    data += _INSTALL_LOGIC_VERSION.encode("utf-8")
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
+
+
+def _get_required_packages() -> List[Tuple[str, str]]:
+    """Return the dependency list.
+
+    Wrapper around the static ``REQUIRED_PACKAGES`` list so future
+    per-platform pinning can be added in one place.
+    """
+    return list(REQUIRED_PACKAGES)
+
+
+def _read_deps_hash() -> Optional[str]:
+    """Read stored deps hash from the venv directory.
+
+    Returns:
+        The stored hash string, or None if not found.
+    """
+    try:
+        with open(DEPS_HASH_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, IOError):
+        return None
+
+
+def _write_deps_hash():
+    """Write the current deps hash to the venv directory."""
+    try:
+        os.makedirs(os.path.dirname(DEPS_HASH_FILE), exist_ok=True)
+        with open(DEPS_HASH_FILE, "w", encoding="utf-8") as f:
+            f.write(_compute_deps_hash())
+    except (OSError, IOError) as e:
+        _log(f"Failed to write deps hash: {e}", Qgis.MessageLevel.Warning)
+
+
+# ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
+
+
+def _find_nvidia_smi() -> Optional[str]:
+    """Locate the nvidia-smi binary.
+
+    On Linux/macOS this is just ``shutil.which``. On Windows the driver
+    installer doesn't always put nvidia-smi on PATH for the QGIS
+    subprocess environment - it commonly lives in ``System32`` or
+    ``Program Files\\NVIDIA Corporation\\NVSMI``. This helper falls
+    back to those locations so detection works on stock laptop driver
+    installs.
+    """
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+
+    if sys.platform != "win32":
+        # QGIS started from a desktop launcher can have a reduced PATH.
+        for path in ("/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi",
+                     "/usr/lib/wsl/lib/nvidia-smi"):
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+        return None
+
+    candidates = []
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidates.append(os.path.join(system_root, "System32", "nvidia-smi.exe"))
+    for env_key in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_key)
+        if base:
+            candidates.append(
+                os.path.join(
+                    base,
+                    "NVIDIA Corporation",
+                    "NVSMI",
+                    "nvidia-smi.exe"))
+    # Hard-coded defaults as a last resort.
+    candidates.append(r"C:\Windows\System32\nvidia-smi.exe")
+    candidates.append(
+        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+    )
+
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _running_in_flatpak() -> bool:
+    """True inside a Flatpak sandbox (e.g. the Flathub QGIS)."""
+    return sys.platform.startswith("linux") and os.path.exists("/.flatpak-info")
+
+
+def _best_gpu(gpus: List[dict]) -> dict:
+    """The GPU with the highest compute capability (first one on ties)."""
+    best_gpu = {}
+    best_compute_cap = -1.0
+    for gpu_info in gpus:
+        cc = gpu_info.get("compute_cap", 0.0)
+        if cc > best_compute_cap:
+            best_compute_cap = cc
+            best_gpu = gpu_info
+    return best_gpu
+
+
+def _detect_with_nvidia_smi() -> Tuple[List[dict], bool]:
+    """Query nvidia-smi. Returns (gpus, transient_failure)."""
+    smi_path = _find_nvidia_smi()
+    if smi_path is None:
+        _log(
+            "GPU detection: nvidia-smi not found on PATH or in the usual "
+            "NVIDIA install locations. Asking the NVIDIA driver library "
+            "(NVML) instead.",
+            Qgis.MessageLevel.Info,
+        )
+        return [], False
+
+    _log(f"GPU detection: using nvidia-smi at {smi_path}", Qgis.MessageLevel.Info)
+
+    try:
+        subprocess_kwargs = _get_subprocess_kwargs()
+        # A laptop GPU in its power-saving state can take several seconds
+        # to wake up and answer.
+        result = proc.run(
+            [
+                smi_path,
+                "--query-gpu=name,compute_cap,driver_version,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=_NVIDIA_SMI_TIMEOUT,
+            **subprocess_kwargs,
+        )
+    except proc.TimeoutExpired:
+        _log(f"nvidia-smi timed out after {_NVIDIA_SMI_TIMEOUT}s", Qgis.MessageLevel.Warning)
+        return [], True
+    except Exception as e:
+        _log(f"nvidia-smi check failed: {e}", Qgis.MessageLevel.Warning)
+        return [], True
+
+    if result.returncode != 0:
+        err_tail = (result.stderr or result.stdout or "").strip()[:300]
+        _log(
+            f"nvidia-smi exited with code {result.returncode}: "
+            f"{err_tail or '(no output)'}",
+            Qgis.MessageLevel.Warning,
+        )
+        return [], False
+
+    if not result.stdout.strip():
+        _log(
+            "nvidia-smi returned no output - the driver may be "
+            "installed but no GPU is currently visible to it "
+            "(check Optimus power-saving / GPU disabled in BIOS).",
+            Qgis.MessageLevel.Warning,
+        )
+        return [], False
+
+    gpus = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+
+        gpu_info = {}
+        if len(parts) >= 1 and parts[0]:
+            gpu_info["name"] = parts[0]
+        if len(parts) >= 2 and parts[1]:
+            try:
+                gpu_info["compute_cap"] = float(parts[1])
+            except ValueError:
+                _LOG.debug("Ignored non-fatal error", exc_info=True)
+        if len(parts) >= 3 and parts[2]:
+            gpu_info["driver_version"] = parts[2]
+        if len(parts) >= 4 and parts[3]:
+            try:
+                gpu_info["memory_mb"] = int(float(parts[3]))
+            except ValueError:
+                _LOG.debug("Ignored non-fatal error", exc_info=True)
+        if gpu_info:
+            gpus.append(gpu_info)
+
+    if not gpus:
+        _log(
+            f"nvidia-smi output parsed to empty GPU info: "
+            f"{result.stdout.strip()[:300]}",
+            Qgis.MessageLevel.Warning,
+        )
+    return gpus, False
+
+
+def _nvml_library_candidates() -> List[str]:
+    """Where the NVIDIA Management Library (NVML) of the driver lives."""
+    if sys.platform == "win32":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        candidates = [os.path.join(system_root, "System32", "nvml.dll")]
+        for env_key in ("ProgramW6432", "ProgramFiles"):
+            base = os.environ.get(env_key)
+            if base:
+                candidates.append(os.path.join(
+                    base, "NVIDIA Corporation", "NVSMI", "nvml.dll"))
+        return candidates
+    if sys.platform.startswith("linux"):
+        # Found through the loader cache. Inside a Flatpak this is the
+        # NVIDIA driver extension (org.freedesktop.Platform.GL.nvidia-*),
+        # which ships the driver libraries but not the nvidia-smi program.
+        return ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+    return []
+
+
+def _detect_with_nvml() -> List[dict]:
+    """Query the NVIDIA driver through NVML (the library behind nvidia-smi).
+
+    Used when nvidia-smi is missing or fails, which is the case inside the
+    Flathub QGIS sandbox: the GPU and the driver libraries are visible
+    there, the host's nvidia-smi program is not.
+    """
+    import ctypes
+
+    lib = None
+    for name in _nvml_library_candidates():
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        _log("GPU detection: no NVIDIA driver library (NVML) found.", Qgis.MessageLevel.Info)
+        return []
+
+    def nvml(name, *fallbacks):
+        for candidate in (name,) + fallbacks:
+            function = getattr(lib, candidate, None)
+            if function is not None:
+                return function
+        raise AttributeError(name)
+
+    class _Memory(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong),
+                    ("free", ctypes.c_ulonglong),
+                    ("used", ctypes.c_ulonglong)]
+
+    try:
+        rc = nvml("nvmlInit_v2", "nvmlInit")()
+    except Exception as exc:
+        _log(f"GPU detection: NVML could not start: {exc}", Qgis.MessageLevel.Warning)
+        return []
+    if rc != 0:
+        _log(
+            f"GPU detection: NVML could not start (error {rc}). The NVIDIA "
+            "driver is not reachable from QGIS.",
+            Qgis.MessageLevel.Warning,
+        )
+        return []
+
+    gpus = []
+    try:
+        text = ctypes.create_string_buffer(96)
+        driver = None
+        if nvml("nvmlSystemGetDriverVersion")(text, ctypes.c_uint(96)) == 0:
+            driver = text.value.decode("ascii", "replace")
+        count = ctypes.c_uint(0)
+        if nvml("nvmlDeviceGetCount_v2", "nvmlDeviceGetCount")(ctypes.byref(count)) != 0:
+            count.value = 0
+        get_handle = nvml("nvmlDeviceGetHandleByIndex_v2", "nvmlDeviceGetHandleByIndex")
+        for index in range(count.value):
+            handle = ctypes.c_void_p()
+            if get_handle(ctypes.c_uint(index), ctypes.byref(handle)) != 0:
+                continue
+            gpu_info = {}
+            text = ctypes.create_string_buffer(96)
+            if nvml("nvmlDeviceGetName")(handle, text, ctypes.c_uint(96)) == 0:
+                gpu_info["name"] = text.value.decode("utf-8", "replace")
+            major, minor = ctypes.c_int(0), ctypes.c_int(0)
+            if nvml("nvmlDeviceGetCudaComputeCapability")(
+                    handle, ctypes.byref(major), ctypes.byref(minor)) == 0:
+                gpu_info["compute_cap"] = float(f"{major.value}.{minor.value}")
+            memory = _Memory()
+            if nvml("nvmlDeviceGetMemoryInfo")(handle, ctypes.byref(memory)) == 0:
+                gpu_info["memory_mb"] = int(memory.total // (1024 * 1024))
+            if driver:
+                gpu_info["driver_version"] = driver
+            if gpu_info:
+                gpus.append(gpu_info)
+    except Exception as exc:
+        _log(f"GPU detection: NVML query failed: {exc}", Qgis.MessageLevel.Warning)
+    finally:
+        try:
+            nvml("nvmlShutdown")()
+        except Exception:
+            _LOG.debug("Ignored non-fatal error", exc_info=True)
+
+    if gpus:
+        _log(f"GPU detection: found through NVML: {gpus}", Qgis.MessageLevel.Info)
+    else:
+        _log("GPU detection: NVML reports no usable NVIDIA GPU.", Qgis.MessageLevel.Info)
+    return gpus
+
+
+def detect_nvidia_gpu() -> Tuple[bool, dict]:
+    """Detect if an NVIDIA GPU is present (nvidia-smi, then NVML).
+
+    Results are cached for the lifetime of the QGIS session, except a
+    transient nvidia-smi failure (timeout) that NVML could not make up
+    for. Every failure path is logged so users can diagnose "GPU not
+    detected" without having to instrument the code themselves.
+
+    Returns:
+        Tuple of (has_gpu, info_dict). info_dict keys: name, compute_cap,
+        driver_version, memory_mb (any key may be missing).
+    """
+    global _gpu_detect_cache
+    if _gpu_detect_cache is not None:
+        return _gpu_detect_cache
+
+    gpus, transient = _detect_with_nvidia_smi()
+    if not gpus:
+        gpus = _detect_with_nvml()
+
+    best_gpu = _best_gpu(gpus)
+    if best_gpu:
+        _log(
+            "NVIDIA GPU detected (best of {}): {}".format(len(gpus), best_gpu),
+            Qgis.MessageLevel.Info,
+        )
+        _gpu_detect_cache = (True, best_gpu)
+        return _gpu_detect_cache
+
+    if _running_in_flatpak():
+        _log(
+            "GPU detection: QGIS runs as a Flatpak. The GPU is visible inside "
+            "it only with the NVIDIA Flatpak driver that matches the system "
+            "driver (installed by 'flatpak update').",
+            Qgis.MessageLevel.Info,
+        )
+    if transient:
+        # A transient timeout/error must not disable GPU detection for the session.
+        return False, {}
+    _gpu_detect_cache = (False, {})
+    return _gpu_detect_cache
+
+
+def _cuda_candidates(needs_cu128: bool) -> list:
+    """Ordered CUDA wheel indexes to try (single source for the cascade)."""
+    if needs_cu128:
+        return ["cu128"]
+    return ["cu126", "cu124", "cu121", "cu118"]
+
+
+def _select_cuda_index(gpu_info: dict) -> Optional[str]:
+    """Choose the correct PyTorch CUDA wheel index based on GPU info.
+
+    Picks the preferred CUDA toolkit the user's driver actually supports,
+    cascading down through ``cu126 -> cu124 -> cu121 -> cu118``
+    if the preferred options require a more recent driver than installed.
+    Each PyTorch wheel index publishes a subset of torch versions, so
+    uv naturally resolves to the latest torch that has wheels for the
+    selected CUDA toolkit.
+
+    Returns ``None`` only when the driver is older than the requirement
+    of every known CUDA toolkit (i.e. CPU install is the only safe
+    option). Blackwell GPUs (sm_100 and sm_120) need cu128 specifically
+    and do not cascade.
+
+    Args:
+        gpu_info: Dict with GPU information from detect_nvidia_gpu().
+
+    Returns:
+        A wheel-index suffix (e.g. ``"cu121"``) or ``None``.
+    """
+    compute_cap = gpu_info.get("compute_cap")
+    gpu_name = gpu_info.get("name", "")
+
+    if compute_cap is not None:
+        needs_cu128 = compute_cap >= _MIN_COMPUTE_CAP_FOR_CU128
+    else:
+        # RTX 5000 Ada is a workstation Ada GPU, not the GeForce RTX 50
+        # series. Match consumer 5050..5099 names or an explicit Blackwell
+        # label only when nvidia-smi did not provide compute capability.
+        name = gpu_name.upper()
+        needs_cu128 = "BLACKWELL" in name or (
+            "ADA" not in name and re.search(r"\bRTX\s+50[5-9]\d\b", name) is not None
+        )
+
+    driver_str = gpu_info.get("driver_version", "")
+    driver_major = None
+    if driver_str:
+        try:
+            driver_major = int(driver_str.split(".")[0])
+        except (ValueError, IndexError):
+            _log(
+                f"Could not parse driver version: {driver_str}",
+                Qgis.MessageLevel.Warning,
+            )
+
+    # Candidates ordered from preferred to oldest fallback. Blackwell
+    # architecture requires cu128 binaries; there is no fallback because
+    # older toolkits don't ship sm_120 kernels. Every other GPU prefers
+    # cu126: current torch releases ship +cu126 wheels and spconv (the
+    # LitePT-L model) has a cu126 wheel but no cu128 one. cu118 is the
+    # floor: PyTorch ships cu118 wheels through ~torch 2.5, which is
+    # fine for pre-2021 NVIDIA drivers still in the wild.
+    candidates = _cuda_candidates(needs_cu128)
+
+    # No driver-version info: trust the preferred candidate and let
+    # the install layer's CUDA->CPU fallback handle a bad guess.
+    if driver_major is None:
+        return candidates[0]
+
+    preferred = candidates[0]
+    for candidate in candidates:
+        required = _CUDA_DRIVER_REQUIREMENTS.get(candidate, 0)
+        if driver_major >= required:
+            if candidate != preferred:
+                _log(
+                    "NVIDIA driver {} is below the requirement for "
+                    "{} (needs >= {}); cascading down to {} which "
+                    "the driver supports.".format(
+                        driver_str,
+                        preferred,
+                        _CUDA_DRIVER_REQUIREMENTS.get(preferred, 0),
+                        candidate,
+                    ),
+                    Qgis.MessageLevel.Info,
+                )
+            return candidate
+
+    _log(
+        "NVIDIA driver {} is below the requirement for every known "
+        "CUDA toolkit ({}); falling back to CPU. Update the NVIDIA "
+        "driver to >= {} to use the latest CUDA wheels.".format(
+            driver_str,
+            ", ".join(candidates),
+            _CUDA_DRIVER_REQUIREMENTS.get(candidates[-1], 0),
+        ),
+        Qgis.MessageLevel.Warning,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Error detection helpers
+# ---------------------------------------------------------------------------
+
+_SSL_ERROR_PATTERNS = [
+    # Tight enough to avoid false positives. The bare string "ssl"
+    # was here historically but it matched "SSL_CERT_DIR" in uv's
+    # informational warning ("Ignoring invalid SSL_CERT_DIR. The
+    # directory does not exist...") which is not an error at all,
+    # and that misclassified the real downstream failure as an SSL
+    # certificate problem.
+    "certificate verify failed",
+    "CERTIFICATE_VERIFY_FAILED",
+    "SSLError",
+    "SSLCertVerificationError",
+    "tlsv1 alert",
+    "unable to get local issuer certificate",
+    "self signed certificate in certificate chain",
+    "self-signed certificate",
+    "unknown ca",
+    "untrusted root",
+    "invalid peer certificate",
+]
+
+_NETWORK_ERROR_PATTERNS = [
+    "connectionreseterror",
+    "connection aborted",
+    "connection was forcibly closed",
+    "remotedisconnected",
+    "connectionerror",
+    "newconnectionerror",
+    "maxretryerror",
+    "protocolerror",
+    "readtimeouterror",
+    "connecttimeouterror",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "name or service not known",
+]
+
+# Windows NTSTATUS crash codes
+_WINDOWS_CRASH_CODES = {
+    3221225477,  # 0xC0000005 unsigned - ACCESS_VIOLATION
+    -1073741819,  # 0xC0000005 signed
+    3221225725,  # 0xC00000FD unsigned - STACK_OVERFLOW
+    -1073741571,  # 0xC00000FD signed
+    3221225781,  # 0xC0000135 unsigned - DLL_NOT_FOUND
+    -1073741515,  # 0xC0000135 signed
+}
+
+
+def _is_ssl_error(stderr: str) -> bool:
+    """Detect SSL/certificate errors in pip output.
+
+    Args:
+        stderr: The error output from pip.
+
+    Returns:
+        True if SSL errors detected.
+    """
+    stderr_lower = stderr.lower()
+    return any(pattern.lower() in stderr_lower for pattern in _SSL_ERROR_PATTERNS)
+
+
+def _is_hash_mismatch(output: str) -> bool:
+    """Detect pip hash mismatch errors.
+
+    Args:
+        output: The pip output to check.
+
+    Returns:
+        True if hash mismatch detected.
+    """
+    output_lower = output.lower()
+    return "do not match the hashes" in output_lower or "hash mismatch" in output_lower
+
+
+# Certificate verification is mandatory. Corporate CAs belong in the trust store.
+def _reset_tls_insecure_fallback() -> None:
+    pass
+
+
+def _tls_insecure_fallback_active() -> bool:
+    return False
+
+
+def _get_pip_install_policy_flags() -> List[str]:
+    """Never compile dependencies in a user's QGIS environment."""
+    return ["--only-binary=:all:"]
+
+
+def _get_uv_install_policy_flags() -> List[str]:
+    return ["--native-tls", "--only-binary=:all:"]
+
+
+def _retry_if_tls_error(result, base_cmd: List[str], use_uv: bool, run_install):
+    """Fail closed; never turn a certificate error into an insecure retry."""
+    if result.returncode and _is_ssl_error(result.stderr or result.stdout or ""):
+        _log("Certificate verification failed. Configure your organisation's "
+             "CA trust or proxy settings and retry; TLS checks remain enabled.",
+             Qgis.MessageLevel.Critical)
+    return result
+
+
+def _is_network_error(output: str) -> bool:
+    """Detect transient network/connection errors in pip output.
+
+    Args:
+        output: The pip output to check.
+
+    Returns:
+        True if network errors detected (excluding SSL).
+    """
+    output_lower = output.lower()
+    if _is_ssl_error(output):
+        return False
+    return any(p in output_lower for p in _NETWORK_ERROR_PATTERNS)
+
+
+def _is_corrupted_venv_error(stderr: str) -> bool:
+    """Detect uv errors that indicate the existing venv is broken.
+
+    Fires when a previous install was interrupted, OR when the
+    previous Reinstall click could not fully wipe the old venv
+    (typically Windows DLL locks - c10.dll and friends are held
+    open by the running QGIS process). uv reports something like:
+
+      Failed to read `<pkg>==<ver>`
+      Failed to read metadata from installed package
+      failed to open file `...dist-info\\METADATA`
+
+    The actionable fix is to restart QGIS so the DLLs unload, then
+    click Reinstall again.
+    """
+    s = stderr.lower()
+    return (
+        "failed to read metadata from installed package" in s
+        or ("failed to read `" in s and "dist-info" in s)
+    )
+
+
+def _format_corrupted_venv_help() -> str:
+    """Actionable message when the venv is partially broken.
+
+    The "restart QGIS" instruction is essential: on Windows, the OS
+    holds DLLs open until the loading process exits. As long as QGIS
+    has imported torch from the broken venv, the broken venv can't
+    be wiped, and any new install layers on top of it and produces
+    this same error again.
+    """
+    return (
+        "The virtual environment is in an inconsistent state "
+        "(typically because a previous Reinstall could not delete "
+        "files that QGIS had loaded into memory). To recover: close "
+        "QGIS completely, reopen it, then click Reinstall "
+        "Dependencies. After the restart no DLLs are loaded yet, so "
+        "the old venv can be rebuilt cleanly. Cache directory: "
+        + CACHE_DIR
+    )
+
+
+def _is_application_control_error(stderr: str) -> bool:
+    """Detect Windows Application Control / AppLocker / WDAC blocking.
+
+    Application Control is a kernel-level allow-listing policy
+    (AppLocker, Windows Defender Application Control / WDAC, Smart App
+    Control). It refuses to execute any binary not signed or path-
+    listed by IT. Critically, this is NOT regular antivirus:
+
+      - folder exclusions do not help (different mechanism);
+      - the cache-dir env var does not help (the standalone python
+        binary is still blocked wherever it is on disk);
+      - the user cannot bypass it without admin / IT involvement.
+
+    Recognising this class of failure lets the plugin direct the user
+    to the right remediation instead of giving misleading 'add an AV
+    exclusion' advice.
+
+    Args:
+        stderr: The error output to inspect.
+
+    Returns:
+        True if the error is from an application-control policy.
+    """
+    s = stderr.lower()
+    return (
+        "winerror 4551" in s
+        or "application control policy" in s
+        or "stratégie de contrôle d'application" in s
+        or "strategie de controle d'application" in s
+        or "applocker" in s
+        or "code integrity" in s
+        or "smart app control" in s
+        or "blocked by your administrator" in s
+        or "blocked by group policy" in s
+        or "blocked by your organization" in s
+    )
+
+
+def _format_application_control_help() -> str:
+    """Actionable message when WDAC / AppLocker blocks the plugin.
+
+    Tells the user exactly what to ask IT for and what NOT to try,
+    since the usual antivirus-exclusion advice does not apply.
+    """
+    return (
+        "The plugin's portable Python is being blocked by a Windows "
+        "Application Control policy (AppLocker / WDAC / Smart App "
+        "Control) on this machine. This is enforced at the kernel "
+        "level by your IT department; folder exclusions and antivirus "
+        "settings will not help. Send this exact request to IT: "
+        "'Please allow the executables under {cache} for my user "
+        "account, or add the folder to the AppLocker / WDAC allow "
+        "list.' If that is not possible, the plugin will not run on "
+        "this machine.".format(cache=CACHE_DIR)
+    )
+
+
+def _is_antivirus_error(stderr: str) -> bool:
+    """Detect antivirus / permission blocking in installer output.
+
+    Recognises classic Windows AV blocking signatures (Defender's
+    "operation did not complete because the file contains a virus",
+    access-denied patterns, AV cloud-deletion artefacts). Caller
+    should check ``_is_application_control_error()`` first - WDAC /
+    AppLocker share some surface patterns but need very different
+    remediation advice.
+
+    Args:
+        stderr: The error output from pip / uv / venv-creation.
+
+    Returns:
+        True if AV / permission blocking is the most likely cause.
+    """
+    stderr_lower = stderr.lower()
+    patterns = [
+        "winerror 225",
+        "operation did not complete successfully because the file contains a virus",
+        # uv signatures when python.exe was quarantined out from under it
+        "failed to inspect python interpreter",
+        "failed to query python interpreter",
+    ]
+    return any(p in stderr_lower for p in patterns)
+
+
+def _is_access_denied_error(stderr: str) -> bool:
+    """A file the installer needs could not be opened or replaced. On its
+    own this does not say why (a file still in use, a read-only folder,
+    an access rule, sometimes a security scan)."""
+    stderr_lower = stderr.lower()
+    return any(p in stderr_lower for p in (
+        "access is denied", "winerror 5", "winerror 32", "permission denied"))
+
+
+def _format_access_denied_help(package_name: str) -> str:
+    return (
+        "Failed to install {pkg}: the system refused access to a file in {cache}. "
+        "Usually a file is still in use (QGIS itself after an earlier run, another "
+        "program, a security scan) or the folder is not writable for your account. "
+        "Restart QGIS and try again; if it fails again, check that you can write to "
+        "that folder, or set RAIL3D_CACHE_DIR to a folder you can "
+        "write to.".format(pkg=package_name, cache=CACHE_DIR)
+    )
+
+
+def _format_antivirus_help(package_name: str) -> str:
+    """Build an actionable AV-blocked error message for the install dialog.
+
+    Includes the exact cache directory the user has to add as a
+    Defender / third-party-AV exclusion. Single message, no extra
+    line breaks beyond what the dialog will wrap.
+    """
+    return (
+        "Failed to install {pkg}: the install was blocked by an "
+        "antivirus / endpoint-security product. Add this folder to "
+        "your AV's exclusion list and try again: {cache}".format(
+            pkg=package_name, cache=CACHE_DIR
+        )
+    )
+
+
+def _verify_venv_python_runs(venv_dir: str) -> Tuple[bool, str]:
+    """Confirm the venv's python.exe is launchable.
+
+    Runs ``python --version`` in a 10-second subprocess. The most
+    common reason this fails right after a successful ``uv venv`` is
+    that an antivirus product has quarantined the freshly extracted
+    python.exe between creation and use - the file either no longer
+    exists or denies execution.
+
+    Args:
+        venv_dir: Path to the venv root.
+
+    Returns:
+        ``(True, version_string)`` if the interpreter launches cleanly,
+        ``(False, diagnostic)`` otherwise. The diagnostic is suitable
+        to surface in a UI dialog.
+    """
+    python_path = get_venv_python_path(venv_dir)
+
+    if not os.path.exists(python_path):
+        return False, (
+            "Virtual environment was created but its Python interpreter "
+            "is missing at {path}. This almost always means an "
+            "antivirus / endpoint-security product deleted or quarantined "
+            "the file. Add {cache} to your AV's exclusion list, delete "
+            "the folder, and reinstall.".format(path=python_path, cache=CACHE_DIR)
+        )
+
+    try:
+        subprocess_kwargs = _get_subprocess_kwargs()
+        result = proc.run(
+            [python_path, "--version"],
+            timeout=10,
+            **subprocess_kwargs,
+        )
+    except FileNotFoundError:
+        return False, (
+            "Virtual environment Python at {path} disappeared between "
+            "creation and verification (typical antivirus quarantine "
+            "pattern). Exclude {cache} from your AV and reinstall."
+            .format(path=python_path, cache=CACHE_DIR)
+        )
+    except proc.TimeoutExpired:
+        return False, (
+            "Virtual environment Python at {path} hung on a simple "
+            "--version call. This usually means a missing Visual C++ "
+            "runtime DLL or an AV agent intercepting the launch. "
+            "Reinstall the Microsoft Visual C++ 2015-2022 Redistributable "
+            "(x64) and try again.".format(path=python_path)
+        )
+    except OSError as exc:
+        # WinError 5 = access denied; OSError 0xC0000135 = missing DLL.
+        msg = str(exc).lower()
+        if "access" in msg or "denied" in msg:
+            return False, (
+                "Virtual environment Python at {path} cannot be "
+                "launched: access denied. Add {cache} to your AV's "
+                "exclusion list and reinstall.".format(
+                    path=python_path, cache=CACHE_DIR
+                )
+            )
+        return False, (
+            "Virtual environment Python at {path} could not be started: "
+            "{err}".format(path=python_path, err=str(exc))
+        )
+
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip()[:500]
+        return False, (
+            "Virtual environment Python at {path} exited with code "
+            "{rc}: {tail}".format(path=python_path, rc=result.returncode, tail=tail)
+        )
+
+    version_line = (result.stdout or result.stderr or "").strip()
+    return True, version_line or "(no version string returned)"
+
+
+def _is_proxy_auth_error(output: str) -> bool:
+    """Detect proxy authentication errors (HTTP 407).
+
+    Args:
+        output: The pip output to check.
+
+    Returns:
+        True if proxy auth error detected.
+    """
+    output_lower = output.lower()
+    patterns = [
+        "407 proxy authentication",
+        "proxy authentication required",
+        "proxyerror",
+    ]
+    return any(p in output_lower for p in patterns)
+
+
+def _is_windows_process_crash(returncode: int) -> bool:
+    """Detect Windows process crashes.
+
+    Args:
+        returncode: The subprocess return code.
+
+    Returns:
+        True if the return code indicates a Windows crash.
+    """
+    if sys.platform != "win32":
+        return False
+    return returncode in _WINDOWS_CRASH_CODES
+
+
+def _classify_batch_error(
+        error_output: str,
+        package_specs: List[str]) -> Optional[str]:
+    """Identify which package in a batch install caused the failure.
+
+    Args:
+        error_output: Combined stdout+stderr from the failed batch install.
+        package_specs: List of package specifiers that were in the batch.
+
+    Returns:
+        The package name that likely caused the failure, or None.
+    """
+    error_lower = error_output.lower()
+    for spec in package_specs:
+        name = re.split(r"[><=!]", spec)[0].strip()
+        if name.lower().replace("-", "_") in error_lower.replace("-", "_"):
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_clean_env_for_venv() -> dict:
+    """Get a clean environment dict for subprocess calls.
+
+    Strips QGIS-specific variables to prevent interference.
+
+    Returns:
+        A clean copy of os.environ.
+    """
+    env = os.environ.copy()
+    for var in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        # QGIS 4's OSGeo4W launcher sets PYTHONEXECUTABLE to QGIS's own
+        # python3.exe. Leaked into `python -m venv` and uv, it makes both
+        # believe they run QGIS's Python: the venv then points at it and
+        # uv installs every package into the portable Python instead of
+        # the venv (seen on QGIS 4.2.2).
+        "PYTHONEXECUTABLE",
+        "__PYVENV_LAUNCHER__",
+        "PYTHONSTARTUP",
+        "VIRTUAL_ENV",
+        "QGIS_PREFIX_PATH",
+        "QGIS_PLUGINPATH",
+        "PROJ_DATA",
+        "PROJ_LIB",
+        "GDAL_DATA",
+        "GDAL_DRIVER_PATH",
+        "PIP_TRUSTED_HOST",
+        "UV_INSECURE_HOST",
+        "PIP_NO_BINARY",
+        "UV_NO_BINARY",
+    ):
+        env.pop(var, None)
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    # Ensure CUDA libraries are discoverable for GPU-accelerated torch.
+    # QGIS desktop launchers may not inherit the user's shell profile,
+    # so CUDA_PATH and LD_LIBRARY_PATH may be empty.
+    _cuda_lib_dirs = []
+    cuda_path = env.get("CUDA_PATH", "")
+    if cuda_path:
+        _cuda_lib_dirs.append(os.path.join(cuda_path, "lib64"))
+    for candidate in ("/opt/cuda/lib64", "/usr/local/cuda/lib64"):
+        if os.path.isdir(candidate) and candidate not in _cuda_lib_dirs:
+            _cuda_lib_dirs.append(candidate)
+    if _cuda_lib_dirs:
+        existing = env.get("LD_LIBRARY_PATH", "")
+        parts = [p for p in existing.split(":") if p]
+        for d in _cuda_lib_dirs:
+            if d not in parts:
+                parts.append(d)
+        env["LD_LIBRARY_PATH"] = ":".join(parts)
+
+    proxy_url = _get_qgis_proxy_settings()
+    if proxy_url:
+        env.setdefault("HTTP_PROXY", proxy_url)
+        env.setdefault("HTTPS_PROXY", proxy_url)
+    return env
+
+
+def _get_subprocess_kwargs() -> dict:
+    """Keyword arguments shared by every program the installer runs.
+
+    Forces a neutral ``cwd`` (the cache directory) so the venv Python
+    can never accidentally import a package from the QGIS plugin's
+    own directory via the current working directory. Console windows
+    stay hidden on Windows because QProcess starts console programs
+    without one from a GUI application.
+
+    Returns:
+        Dict with cwd.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return {"cwd": CACHE_DIR}
+
+
+def _get_qgis_proxy_settings() -> Optional[str]:
+    """Read proxy configuration from QGIS settings.
+
+    Returns:
+        A proxy URL string, or None if not configured.
+    """
+    try:
+        from qgis.core import QgsSettings
+        from urllib.parse import quote as url_quote
+
+        settings = QgsSettings()
+        enabled = settings.value("proxy/proxyEnabled", False, type=bool)
+        if not enabled:
+            return None
+        proxy_type = settings.value("proxy/proxyType", "HttpProxy", type=str)
+        if proxy_type == "NoProxy":
+            return None
+        if proxy_type == "Socks5Proxy":
+            raise RuntimeError("SOCKS proxies are not supported by this installer. Configure an HTTP proxy for package downloads.")
+
+        host = settings.value("proxy/proxyHost", "", type=str)
+        if not host:
+            return None
+
+        port = settings.value("proxy/proxyPort", "", type=str)
+        user = settings.value("proxy/proxyUser", "", type=str)
+        password = settings.value("proxy/proxyPassword", "", type=str)
+
+        proxy_url = "http://"
+        if user:
+            proxy_url += url_quote(user, safe="")
+            if password:
+                proxy_url += ":" + url_quote(password, safe="")
+            proxy_url += "@"
+        proxy_url += host
+        if port:
+            proxy_url += f":{port}"
+        return proxy_url
+    except RuntimeError:
+        raise
+    except Exception as e:
+        _log(f"Could not read QGIS proxy settings: {e}", Qgis.MessageLevel.Warning)
+        return None
+
+
+def _get_pip_proxy_args() -> List[str]:
+    """Get pip --proxy argument if QGIS proxy is configured.
+
+    Returns:
+        List with --proxy args, or empty list.
+    """
+    proxy_url = _get_qgis_proxy_settings()
+    if proxy_url:
+        safe_url = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+        _log(f"Using QGIS proxy for pip: {safe_url}", Qgis.MessageLevel.Info)
+        return ["--proxy", proxy_url]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Venv path helpers
+# ---------------------------------------------------------------------------
+
+
+def get_venv_dir() -> str:
+    """Get the venv directory path.
+
+    Returns:
+        Path to the virtual environment directory.
+    """
+    return VENV_DIR
+
+
+def get_venv_site_packages(venv_dir: str = None) -> str:
+    """Get the site-packages directory within the venv.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+
+    Returns:
+        Path to the site-packages directory.
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    if sys.platform == "win32":
+        return os.path.join(venv_dir, "Lib", "site-packages")
+    else:
+        lib_dir = os.path.join(venv_dir, "lib")
+        if os.path.exists(lib_dir):
+            for entry in os.listdir(lib_dir):
+                if entry.startswith("python") and os.path.isdir(
+                    os.path.join(lib_dir, entry)
+                ):
+                    site_packages = os.path.join(
+                        lib_dir, entry, "site-packages")
+                    if os.path.exists(site_packages):
+                        return site_packages
+
+        py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        return os.path.join(venv_dir, "lib", py_version, "site-packages")
+
+
+def get_venv_python_path(venv_dir: str = None) -> str:
+    """Get the Python executable path within the venv.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+
+    Returns:
+        Path to the venv Python executable.
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    if sys.platform == "win32":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    else:
+        return os.path.join(venv_dir, "bin", "python3")
+
+
+def get_venv_pip_path(venv_dir: str = None) -> str:
+    """Get the pip executable path within the venv.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+
+    Returns:
+        Path to the venv pip executable.
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    if sys.platform == "win32":
+        return os.path.join(venv_dir, "Scripts", "pip.exe")
+    else:
+        return os.path.join(venv_dir, "bin", "pip")
+
+
+def venv_exists(venv_dir: str = None) -> bool:
+    """Check if the venv exists and has a Python executable.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+
+    Returns:
+        True if the venv Python executable exists.
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+    python_path = get_venv_python_path(venv_dir)
+    return os.path.exists(python_path)
+
+
+def ensure_venv_packages_available() -> bool:
+    """Add the venv site-packages to sys.path so packages can be imported.
+
+    Returns:
+        True if packages were made available, False otherwise.
+    """
+    if not venv_exists():
+        _log("Venv does not exist, cannot load packages", Qgis.MessageLevel.Warning)
+        return False
+
+    site_packages = get_venv_site_packages()
+    if not os.path.exists(site_packages):
+        _log(f"Venv site-packages not found: {site_packages}", Qgis.MessageLevel.Warning)
+        return False
+
+    if site_packages not in sys.path:
+        sys.path.insert(0, site_packages)
+        _log(
+            f"Added venv site-packages to sys.path: {site_packages}",
+            Qgis.MessageLevel.Info)
+
+    # The CUDA allocator mode (expandable segments or not) is decided by
+    # core/cuda_allocator.py when LitePT-L loads, from what the GPU driver
+    # supports and the plugin setting; a process-wide environment default
+    # would also fail on shared vGPUs and on the Windows drivers that have
+    # no working virtual memory management.
+
+    # spconv's fallback build (RTX 50 series) runs through the driver's
+    # PTX compiler, whose on-disk cache keeps the compiled kernels between
+    # sessions. The default cache is too small for spconv's kernel set,
+    # so each QGIS session would compile again. Read by the driver when
+    # CUDA initialises, which happens after this point (torch import).
+    if (_read_install_marker() or {}).get("spconv_fallback"):
+        os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(2 * 1024 ** 3))
+
+    # On Windows, register DLL directories for native packages (torch,
+    # etc.) so that the OS loader can find their DLLs when importing
+    # from the venv inside QGIS's process.
+    if sys.platform == "win32":
+        _add_windows_dll_directories(site_packages)
+
+    return True
+
+
+# DLL directories already registered in this QGIS session, with their
+# handles. ensure_venv_packages_available() runs on every model check of
+# the dock; registering (and logging) the same folder again each time is
+# useless, so each folder is added once.
+_DLL_DIRECTORY_HANDLES: dict = {}
+
+
+def _add_windows_dll_directories(site_packages: str) -> None:
+    """Register DLL search directories for native packages on Windows.
+
+    Torch and other native packages ship DLLs in subdirectories (e.g.
+    ``torch/lib/``) that the OS loader doesn't search by default when loading
+    from a foreign venv inside QGIS's process.  We add them via
+    ``os.add_dll_directory()`` and also prepend to ``PATH`` to cover legacy
+    ``LoadLibrary`` calls without search flags.
+
+    Args:
+        site_packages: Path to the venv site-packages directory.
+    """
+    dll_dirs = [
+        os.path.join(site_packages, "torch", "lib"),
+        os.path.join(site_packages, "torch", "bin"),
+        os.path.join(site_packages, "torchvision"),
+    ]
+
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    for dll_dir in dll_dirs:
+        if os.path.isdir(dll_dir):
+            if dll_dir in _DLL_DIRECTORY_HANDLES:
+                continue
+            try:
+                _DLL_DIRECTORY_HANDLES[dll_dir] = os.add_dll_directory(dll_dir)
+                _log(f"Added DLL directory: {dll_dir}", Qgis.MessageLevel.Info)
+            except OSError as exc:
+                _log(
+                    f"add_dll_directory({dll_dir}) failed: {exc}",
+                    Qgis.MessageLevel.Warning)
+            if dll_dir not in path_parts:
+                path_parts.insert(0, dll_dir)
+
+    os.environ["PATH"] = os.pathsep.join(path_parts)
+
+
+# ---------------------------------------------------------------------------
+# System Python resolution
+# ---------------------------------------------------------------------------
+
+
+def _is_python_executable_name(path: str) -> bool:
+    """Return True when a path name looks like a Python interpreter."""
+    name = os.path.basename(path).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name in ("python", "python3"):
+        return True
+    if not name.startswith("python"):
+        return False
+    suffix = name[6:]
+    if "-" in suffix:
+        return False
+    return suffix.isdigit() or (suffix.count(".") == 1 and all(part.isdigit()
+                                                               for part in suffix.split(".")))
+
+
+def _is_macos_qgis_app_bundle_python(path: str) -> bool:
+    """Return True for unsafe Python launchers in QGIS.app/Contents/MacOS."""
+    if not (platform.system() == "Darwin" or sys.platform == "darwin"):
+        return False
+    parts = os.path.abspath(path).split(os.sep)
+    for idx, part in enumerate(parts):
+        lower = part.lower()
+        if not (lower.startswith("qgis") and lower.endswith(".app")):
+            continue
+        if idx + 2 >= len(parts):
+            return False
+        if parts[idx + 1].lower() != "contents" or parts[idx +
+                                                         2].lower() != "macos":
+            return False
+        name = os.path.basename(path).lower()
+        return name.startswith("qgis") or _is_python_executable_name(path)
+    return False
+
+
+def _get_qgis_python() -> Optional[str]:
+    """Get the path to QGIS's bundled Python on Windows.
+
+    Returns:
+        Path to the Python executable, or None if not found.
+    """
+    if sys.platform != "win32":
+        return None
+
+    python_path = os.path.join(sys.prefix, "python.exe")
+    if not os.path.exists(python_path):
+        python_path = os.path.join(sys.prefix, "python3.exe")
+
+    if not os.path.exists(python_path):
+        _log("QGIS bundled Python not found at sys.prefix", Qgis.MessageLevel.Warning)
+        return None
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        subprocess_kwargs = _get_subprocess_kwargs()
+
+        result = proc.run(
+            [python_path, "-c", "import sys; print(sys.version)"],
+            timeout=15,
+            env=env,
+            **subprocess_kwargs,
+        )
+        if result.returncode == 0:
+            _log(f"QGIS Python verified: {result.stdout.strip()}", Qgis.MessageLevel.Info)
+            return python_path
+        else:
+            _log(
+                f"QGIS Python failed verification: {result.stderr}",
+                Qgis.MessageLevel.Warning,
+            )
+            return None
+    except Exception as e:
+        _log(f"QGIS Python verification error: {e}", Qgis.MessageLevel.Warning)
+        return None
+
+
+def _get_linux_system_python() -> Optional[str]:
+    """Get a suitable system Python on Linux for creating venvs.
+
+    Searches for python3 on PATH, verifies version >= 3.9 and
+    that the venv module is available.
+
+    Returns:
+        Path to a suitable Python executable, or None if not found.
+    """
+    if sys.platform == "win32" or sys.platform == "darwin":
+        return None
+
+    candidates = []
+
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if path and path not in candidates:
+            candidates.append(path)
+
+    if sys.executable and os.path.isfile(sys.executable):
+        real_path = os.path.realpath(sys.executable)
+        if real_path not in candidates:
+            candidates.append(real_path)
+
+    for candidate in candidates:
+        try:
+            env = _get_clean_env_for_venv()
+            env["PYTHONIOENCODING"] = "utf-8"
+            subprocess_kwargs = _get_subprocess_kwargs()
+
+            result = proc.run(
+                [
+                    candidate,
+                    "-c",
+                    (
+                        "import sys, venv; "
+                        "print(sys.version_info.major, "
+                        "sys.version_info.minor, "
+                        "sys.version_info.micro)"
+                    ),
+                ],
+                timeout=15,
+                env=env,
+                **subprocess_kwargs,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                if "No module named" in stderr and "venv" in stderr:
+                    _log(
+                        "System Python {} lacks the venv module. "
+                        "Install it with: sudo apt install python3-venv".format(candidate),
+                        Qgis.MessageLevel.Warning,
+                    )
+                else:
+                    _log(
+                        "System Python {} failed verification: {}".format(
+                            candidate, stderr
+                        ),
+                        Qgis.MessageLevel.Warning,
+                    )
+                continue
+
+            parts = result.stdout.strip().split()
+            if len(parts) == 3:
+                major, minor, micro = int(
+                    parts[0]), int(
+                    parts[1]), int(
+                    parts[2])
+                if (major, minor) >= (3, 9):
+                    _log(
+                        "System Python verified: {} ({}.{}.{})".format(
+                            candidate, major, minor, micro
+                        ),
+                        Qgis.MessageLevel.Info,
+                    )
+                    return candidate
+                else:
+                    _log(
+                        "System Python {} version {}.{}.{} "
+                        "is too old (need >= 3.9)".format(
+                            candidate, major, minor, micro
+                        ),
+                        Qgis.MessageLevel.Warning,
+                    )
+            else:
+                _log(
+                    "Unexpected version output from {}: {}".format(
+                        candidate, result.stdout.strip()
+                    ),
+                    Qgis.MessageLevel.Warning,
+                )
+        except Exception as e:
+            _log(
+                "Error checking system Python {}: {}".format(candidate, e),
+                Qgis.MessageLevel.Warning,
+            )
+            continue
+
+    _log("No suitable system Python found on Linux", Qgis.MessageLevel.Warning)
+    return None
+
+
+def _get_system_python() -> str:
+    """Get the path to the Python executable for creating venvs.
+
+    Uses standalone Python downloaded by python_manager, with fallback
+    to QGIS's bundled Python on Windows or system Python on Linux.
+
+    Returns:
+        Path to the Python executable.
+
+    Raises:
+        RuntimeError: If no suitable Python is found.
+    """
+    from .python_manager import get_standalone_python_path, standalone_python_exists
+
+    if standalone_python_exists():
+        python_path = get_standalone_python_path()
+        _log(f"Using standalone Python: {python_path}", Qgis.MessageLevel.Info)
+        return python_path
+
+    if sys.platform == "win32":
+        qgis_python = _get_qgis_python()
+        if qgis_python:
+            _log(
+                "Standalone Python unavailable, using QGIS Python as fallback",
+                Qgis.MessageLevel.Warning,
+            )
+            return qgis_python
+    elif _is_macos_qgis_app_bundle_python(sys.executable):
+        raise RuntimeError(
+            "QGIS app-bundle Python is not safe for creating virtual "
+            "environments; use uv-managed Python instead."
+        )
+    elif sys.platform.startswith("linux"):
+        linux_python = _get_linux_system_python()
+        if linux_python:
+            _log(
+                "Standalone Python unavailable, using system Python as fallback",
+                Qgis.MessageLevel.Warning,
+            )
+            return linux_python
+
+    if sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "Python standalone not installed and no suitable system Python found. "
+            "Please ensure python3 and python3-venv are installed "
+            "(e.g., sudo apt install python3-venv) and click 'Install Dependencies'.")
+    raise RuntimeError(
+        "Python standalone not installed. "
+        "Please click 'Install Dependencies' to download Python automatically."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Venv creation
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_partial_venv(venv_dir: str):
+    """Remove a partially-created venv directory.
+
+    Args:
+        venv_dir: Path to the venv directory to clean up.
+    """
+    if os.path.exists(venv_dir):
+        try:
+            shutil.rmtree(venv_dir, ignore_errors=True)
+            _log(f"Cleaned up partial venv: {venv_dir}", Qgis.MessageLevel.Info)
+        except Exception:
+            _log(f"Could not clean up partial venv: {venv_dir}", Qgis.MessageLevel.Warning)
+
+
+def create_venv(
+    venv_dir: str = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+) -> Tuple[bool, str]:
+    """Create a virtual environment.
+
+    Args:
+        venv_dir: Optional directory for the venv. Uses VENV_DIR if None.
+        progress_callback: Optional function called with (percent, message).
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    _log(f"Creating virtual environment at: {venv_dir}", Qgis.MessageLevel.Info)
+
+    if progress_callback:
+        progress_callback(10, "Creating virtual environment...")
+
+    system_python = None
+    python_lookup_error = ""
+    try:
+        system_python = _get_system_python()
+    except RuntimeError as exc:
+        python_lookup_error = str(exc)
+    if python_lookup_error and system_python is None:
+        _log(
+            "Python lookup failed; falling back to uv-managed Python if "
+            f"available: {python_lookup_error}",
+            Qgis.MessageLevel.Warning,
+        )
+    if system_python:
+        _log(f"Using Python: {system_python}", Qgis.MessageLevel.Info)
+
+    from .uv_manager import get_uv_path, uv_exists
+
+    use_uv = uv_exists()
+
+    # Venv creation strategy
+    # ----------------------
+    # We prefer ``python -m venv`` over ``uv venv`` whenever a base
+    # interpreter is available.
+    #
+    # On WINDOWS we pass ``--copies`` so the venv's ``python.exe`` is a
+    # byte-for-byte copy of the base interpreter instead of the small
+    # "redirector launcher" that the default symlink mode (and uv)
+    # produces. The redirector is a tiny custom executable that Windows
+    # antivirus heuristics frequently quarantine on consumer / corporate
+    # laptops because it has no cloud-reputation entry. A copy of the
+    # well-known python-build-standalone binary passes AV cleanly.
+    #
+    # On LINUX (and macOS) we MUST NOT pass ``--copies`` with the
+    # python-build-standalone tarball. The standalone python3 binary
+    # is built with ``RPATH=$ORIGIN/../lib`` so it finds
+    # ``libpython3.12.so.1.0`` next to itself. ``venv --copies``
+    # copies the binary into ``venv/bin/`` but does NOT copy the
+    # libpython next to it (venv has no notion that python-build-
+    # standalone ships libpython as a separate file). After the copy,
+    # the binary's RPATH resolves to the empty ``venv/lib/`` and
+    # every invocation dies with
+    #     error while loading shared libraries:
+    #         .../venv/bin/../lib/libpython3.12.so.1.0:
+    #         cannot open shared object file
+    # The default symlink mode points ``venv/bin/python3`` back at the
+    # standalone install, so RPATH still resolves to the real lib
+    # directory and the venv works. AV quarantine is not a concern on
+    # Linux / macOS, so the symlink default is the right pick there.
+    #
+    # uv is only used as a fallback when no base interpreter is
+    # reachable (rare - the standalone Python is downloaded on first
+    # run).
+    if system_python:
+        # --without-pip: python-build-standalone Linux tarballs don't
+        # ship the bundled pip wheel under Lib/ensurepip/_bundled/, so
+        # the default ensurepip step that `python -m venv` runs at the
+        # end of creation exits 127 and torpedoes the whole command.
+        # We use uv for all package installs anyway (uv doesn't need
+        # pip inside the venv), so skipping ensurepip is the right call
+        # on every platform - not just Linux.
+        venv_argv = [system_python, "-m", "venv"]
+        on_windows = sys.platform == "win32"
+        if on_windows:
+            venv_argv.append("--copies")
+        venv_argv += ["--without-pip", venv_dir]
+        cmd = venv_argv
+        _log(
+            "Creating venv with `python -m venv {}--without-pip` "
+            "(uv-managed packages): {}".format(
+                "--copies " if on_windows else "",
+                system_python,
+            ),
+            Qgis.MessageLevel.Info,
+        )
+    elif use_uv:
+        uv_path = get_uv_path()
+        uv_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+        cmd = [
+            uv_path, "venv", "--managed-python",
+            "--python", uv_python, venv_dir,
+        ]
+        _log(
+            f"Creating venv with uv-managed Python (fallback): {uv_path}",
+            Qgis.MessageLevel.Warning,
+        )
+    else:
+        return False, python_lookup_error
+
+    try:
+        env = _get_clean_env_for_venv()
+        subprocess_kwargs = _get_subprocess_kwargs()
+
+        result = proc.run(
+            cmd,
+            timeout=120,
+            env=env,
+            **subprocess_kwargs,
+        )
+
+        # Recovery path: if the primary `python -m venv --copies
+        # --without-pip` failed for any reason (rare now that
+        # ensurepip is skipped) and uv is available, try uv-managed
+        # Python as a last resort. Retrying the exact same stdlib
+        # command would be pointless.
+        if result.returncode != 0 and use_uv:
+            stderr_tail = (
+                result.stderr.strip() if result.stderr else str(result.returncode)
+            )
+            _log(
+                f"`python -m venv` failed ({stderr_tail}); retrying with "
+                f"uv-managed Python.",
+                Qgis.MessageLevel.Warning,
+            )
+            _cleanup_partial_venv(venv_dir)
+            uv_path = get_uv_path()
+            uv_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+            cmd = [
+                uv_path, "venv", "--managed-python",
+                "--python", uv_python, venv_dir,
+            ]
+            result = proc.run(
+                cmd,
+                timeout=120,
+                env=env,
+                **subprocess_kwargs,
+            )
+
+        if result.returncode == 0:
+            _log("Virtual environment created successfully", Qgis.MessageLevel.Success)
+
+            # When using uv, pip is not needed in the venv (uv handles
+            # installs directly).  Only bootstrap pip for stdlib venvs.
+            if not use_uv:
+                pip_path = get_venv_pip_path(venv_dir)
+                if not os.path.exists(pip_path):
+                    _log(
+                        "pip not found in venv, bootstrapping with ensurepip...",
+                        Qgis.MessageLevel.Info,
+                    )
+                    python_in_venv = get_venv_python_path(venv_dir)
+                    ensurepip_cmd = [
+                        python_in_venv,
+                        "-m",
+                        "ensurepip",
+                        "--upgrade",
+                    ]
+                    try:
+                        ensurepip_result = proc.run(
+                            ensurepip_cmd,
+                            timeout=120,
+                            env=env,
+                            **subprocess_kwargs,
+                        )
+                        if ensurepip_result.returncode == 0:
+                            _log(
+                                "pip bootstrapped via ensurepip",
+                                Qgis.MessageLevel.Success)
+                        else:
+                            err = ensurepip_result.stderr or ensurepip_result.stdout
+                            _log(
+                                f"ensurepip failed: {err[:200]}", Qgis.MessageLevel.Warning)
+                            _cleanup_partial_venv(venv_dir)
+                            return (
+                                False,
+                                f"Failed to bootstrap pip: {err[:200]}",
+                            )
+                    except Exception as e:
+                        _log(f"ensurepip exception: {e}", Qgis.MessageLevel.Warning)
+                        _cleanup_partial_venv(venv_dir)
+                        return (
+                            False,
+                            f"Failed to bootstrap pip: {str(e)[:200]}",
+                        )
+
+            # Pre-flight: confirm the freshly-created Python is actually
+            # launchable. Catches the common AV-quarantine pattern where
+            # python.exe is extracted, scanned, and silently deleted -
+            # in which case the later "uv pip install" call fails with
+            # the confusing "Failed to inspect Python interpreter"
+            # message instead of telling the user it's their AV.
+            python_ok, python_diag = _verify_venv_python_runs(venv_dir)
+            if not python_ok:
+                _log(
+                    f"Venv Python pre-flight failed: {python_diag}",
+                    Qgis.MessageLevel.Critical)
+                _cleanup_partial_venv(venv_dir)
+                return False, python_diag
+            _log(f"Venv Python pre-flight: {python_diag}", Qgis.MessageLevel.Info)
+
+            if progress_callback:
+                progress_callback(15, "Virtual environment created")
+            return True, "Virtual environment created"
+        else:
+            error_msg = (
+                result.stderr or result.stdout
+                or f"Return code {result.returncode}")
+            _log(f"Failed to create venv: {error_msg}", Qgis.MessageLevel.Critical)
+            _cleanup_partial_venv(venv_dir)
+            if _is_application_control_error(error_msg):
+                return False, _format_application_control_help()
+            return False, f"Failed to create venv: {error_msg[:1500]}"
+
+    except proc.TimeoutExpired:
+        _log("Virtual environment creation timed out", Qgis.MessageLevel.Critical)
+        _cleanup_partial_venv(venv_dir)
+        return False, "Virtual environment creation timed out"
+    except FileNotFoundError:
+        missing_executable = cmd[0] if cmd else system_python
+        _log(
+            f"Venv creation executable not found: {missing_executable}",
+            Qgis.MessageLevel.Critical)
+        return False, f"Executable not found: {missing_executable}"
+    except Exception as e:
+        err_str = str(e)
+        _log(f"Exception during venv creation: {err_str}", Qgis.MessageLevel.Critical)
+        _cleanup_partial_venv(venv_dir)
+        if _is_application_control_error(err_str):
+            return False, _format_application_control_help()
+        return False, f"Error: {err_str[:1500]}"
+
+
+# ---------------------------------------------------------------------------
+# Pip install with progress
+# ---------------------------------------------------------------------------
+
+
+class _PipResult:
+    """Lightweight result object compatible with subprocess.CompletedProcess."""
+
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _parse_pip_download_line(line: str) -> Optional[str]:
+    """Extract a human-readable status from a pip stdout/stderr line.
+
+    Args:
+        line: A line from pip output.
+
+    Returns:
+        Human-readable download status string, or None.
+    """
+    m = re.search(r"Downloading\s+(\S+)\s+\(([^)]+)\)", line)
+    if not m:
+        return None
+
+    raw_name = m.group(1)
+    size = m.group(2)
+
+    if "/" in raw_name:
+        raw_name = raw_name.rsplit("/", 1)[-1]
+
+    name_match = re.match(r"([A-Za-z][A-Za-z0-9_]*)", raw_name)
+    pkg_name = name_match.group(1) if name_match else raw_name
+
+    size_match = re.match(r"([\d.]+)\s*(kB|MB|GB)", size)
+    if size_match:
+        num = float(size_match.group(1))
+        unit = size_match.group(2)
+        if unit == "MB" and num >= 1000:
+            size = "{:.1f} GB".format(num / 1000)
+
+    return "Downloading {} ({})".format(pkg_name, size)
+
+
+def _run_pip_install(
+    cmd: List[str],
+    timeout: int,
+    env: dict,
+    subprocess_kwargs: dict,
+    label: str,
+    progress_start: int,
+    progress_end: int,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> _PipResult:
+    """Run a pip/uv install command with real-time progress updates.
+
+    Args:
+        cmd: The install command to run.
+        timeout: Maximum time in seconds.
+        env: Environment variables dict.
+        subprocess_kwargs: Platform-specific kwargs for subprocess.
+        label: Human-readable label for progress messages
+            (e.g. "GPU PyTorch (~2.5 GB)" or "remaining dependencies").
+        progress_start: Start percentage for this install's progress range.
+        progress_end: End percentage for this install's progress range.
+        progress_callback: Optional progress callback.
+        cancel_check: Optional cancellation check callback.
+
+    Returns:
+        _PipResult with returncode, stdout, and stderr.
+    """
+    poll_interval = 2
+
+    stdout_fd, stdout_path = tempfile.mkstemp(
+        suffix="_stdout.txt", prefix="pip_")
+    stderr_fd, stderr_path = tempfile.mkstemp(
+        suffix="_stderr.txt", prefix="pip_")
+    # QProcess opens the two files itself; only their names are needed.
+    os.close(stdout_fd)
+    os.close(stderr_fd)
+
+    def read_file(path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    process = None
+    try:
+        process = proc.Background(
+            cmd, stdout_path, stderr_path, env=env,
+            cwd=subprocess_kwargs.get("cwd"))
+
+        start_time = time.monotonic()
+        last_download_status = ""
+
+        while not process.wait(poll_interval):
+            elapsed = int(time.monotonic() - start_time)
+
+            if cancel_check and cancel_check():
+                process.stop()
+                return _PipResult(-1, "", "Installation cancelled")
+
+            if elapsed >= timeout:
+                process.stop()
+                raise proc.TimeoutExpired(cmd, timeout)
+
+            # Read the last lines to find download progress.
+            tail = read_file(stdout_path)[-4096:]
+            for line in reversed(tail.strip().splitlines()):
+                parsed = _parse_pip_download_line(line)
+                if parsed:
+                    last_download_status = parsed
+                    break
+
+            if elapsed >= 60:
+                elapsed_str = "{}m {}s".format(elapsed // 60, elapsed % 60)
+            else:
+                elapsed_str = "{}s".format(elapsed)
+
+            if last_download_status:
+                msg = "{}... {}".format(last_download_status, elapsed_str)
+            else:
+                msg = "Installing {}... {}".format(label, elapsed_str)
+
+            progress_range = progress_end - progress_start
+            if timeout > 0:
+                fraction = min(elapsed / timeout, 0.9)
+            else:
+                fraction = 0
+            interpolated = progress_start + int(progress_range * fraction)
+            interpolated = min(interpolated, progress_end - 1)
+
+            if progress_callback:
+                progress_callback(interpolated, msg)
+
+        return _PipResult(process.returncode, read_file(stdout_path), read_file(stderr_path))
+
+    except proc.TimeoutExpired:
+        raise
+    except Exception:
+        if process is not None:
+            process.stop()
+        raise
+    finally:
+        for path in (stdout_path, stderr_path):
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Dependency installation
+# ---------------------------------------------------------------------------
+
+
+def _get_installed_versions(
+    python_path: str,
+    package_names,
+    env: dict,
+    subprocess_kwargs: dict,
+) -> dict:
+    """Return ``{name: version}`` for the given packages installed in the venv.
+
+    Uses ``uv pip freeze`` when uv is available (fast, no torch import),
+    otherwise ``python -m pip freeze``. Names are normalised to
+    lower-case with dashes. Missing packages are simply absent from the
+    result; any failure is logged and returns ``{}``.
+    """
+    from .uv_manager import get_uv_path, uv_exists
+
+    wanted = {str(n).lower().replace("_", "-") for n in package_names}
+    if uv_exists():
+        cmd = [get_uv_path(), "pip", "freeze", "--python", python_path]
+    else:
+        cmd = [python_path, "-m", "pip", "freeze",
+               "--disable-pip-version-check"]
+    try:
+        result = proc.run(
+            cmd, timeout=120, env=env,
+            **subprocess_kwargs,
+        )
+    except Exception as exc:
+        _log(f"Could not list installed packages: {exc}", Qgis.MessageLevel.Warning)
+        return {}
+    if result.returncode != 0:
+        _log(
+            "Could not list installed packages: "
+            f"{(result.stderr or result.stdout or '')[:300]}",
+            Qgis.MessageLevel.Warning,
+        )
+        return {}
+    found = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        key = name.strip().lower().replace("_", "-")
+        if key in wanted:
+            found[key] = version.strip()
+    return found
+
+
+def _is_within(path: str, folder: str) -> bool:
+    """True when ``path`` is ``folder`` or lies inside it."""
+    try:
+        path = os.path.normcase(os.path.abspath(path))
+        folder = os.path.normcase(os.path.abspath(folder))
+        return os.path.commonpath([path, folder]) == folder
+    except (TypeError, ValueError):
+        return False
+
+
+def _host_numpy_version(venv_dir: str = None) -> Optional[str]:
+    """Version of the NumPy that QGIS's own Python provides, or None.
+
+    The plugin's packages are imported into the QGIS process. A NumPy that
+    QGIS (or another plugin) loaded first is the one every compiled
+    package from the plugin environment then runs against. Copies from
+    the plugin's own folders are ignored.
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    def ours(path):
+        return _is_within(path, venv_dir) or _is_within(path, CACHE_DIR)
+
+    module = sys.modules.get("numpy")
+    location = getattr(module, "__file__", None) or ""
+    if module is not None and location and not ours(location):
+        return str(getattr(module, "__version__", "") or "") or None
+    try:
+        from importlib import metadata
+        paths = [p for p in sys.path if p and not ours(p)]
+        for dist in metadata.distributions(name="numpy", path=paths):
+            return dist.version
+    except Exception:
+        _LOG.debug("Ignored non-fatal error", exc_info=True)
+    return None
+
+
+def _host_numpy_pin(venv_dir: str = None) -> Optional[str]:
+    """``numpy==<QGIS's version>`` when QGIS's own NumPy is 1.x, else None.
+
+    Recent SciPy releases (1.17 and later) need NumPy 2 and fail to import
+    against an older NumPy that QGIS already loaded ("module 'numpy' has
+    no attribute 'long'"). Pinning the plugin environment to the exact
+    NumPy of QGIS makes the resolver pick SciPy and the other compiled
+    packages that work with it, whichever copy is imported first. QGIS
+    builds with NumPy 2 are left as they were.
+    """
+    version = _host_numpy_version(venv_dir)
+    if not version:
+        return None
+    public = version.split("+", 1)[0].strip()
+    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?$", public)
+    if match is None or int(match.group(1)) >= 2:
+        return None
+    return f"numpy=={public}"
+
+
+# Installed after torch and torchvision; resolved against QGIS's NumPy
+# when that exact NumPy cannot be installed (see _host_numpy_constraints).
+_TORCH_FAMILY = ("torch", "torchvision", "timm")
+
+
+def _write_numpy_stand_in(folder: str, version: str) -> str:
+    """Write a metadata-only ``numpy-<version>`` wheel into ``folder``.
+
+    It is only ever given to a dry-run resolution, never installed: it lets
+    the resolver treat QGIS's own NumPy as present even when no real wheel
+    of that version exists for the plugin's Python.
+    """
+    import zipfile
+
+    dist_info = f"numpy-{version}.dist-info"
+    files = {
+        f"{dist_info}/METADATA":
+            f"Metadata-Version: 2.1\nName: numpy\nVersion: {version}\n",
+        f"{dist_info}/WHEEL":
+            "Wheel-Version: 1.0\nGenerator: aerial-lidar-classifier\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    files[f"{dist_info}/RECORD"] = "".join(
+        f"{name},,\n" for name in list(files) + [f"{dist_info}/RECORD"])
+    path = os.path.join(folder, f"numpy-{version}-py3-none-any.whl")
+    with zipfile.ZipFile(path, "w") as wheel:
+        for name, text in files.items():
+            wheel.writestr(name, text)
+    return path
+
+
+def _numpy_wheel_installable(
+    pin: str, python_path: str, env: dict, subprocess_kwargs: dict,
+    use_uv: bool, uv_path: Optional[str],
+) -> Tuple[bool, str]:
+    """Dry-run ``pin`` (``numpy==X``) binary-only for the plugin's Python."""
+    if use_uv:
+        cmd = [uv_path, "pip", "install", "--python", python_path,
+               "--dry-run", "--no-deps"]
+        cmd.extend(_get_uv_install_policy_flags())
+    else:
+        cmd = [python_path, "-m", "pip", "install", "--dry-run", "--no-deps",
+               "--ignore-installed", "--quiet", "--disable-pip-version-check"]
+        cmd.extend(_get_pip_install_policy_flags())
+        cmd.extend(_get_pip_proxy_args())
+    cmd.append(pin)
+    try:
+        result = proc.run(cmd, timeout=300, env=env, **subprocess_kwargs)
+    except Exception as exc:
+        return False, str(exc)
+    return result.returncode == 0, (result.stderr or "") + (result.stdout or "")
+
+
+def _resolve_against_host_numpy(
+    host_version: str, venv_dir: str, python_path: str, env: dict,
+    subprocess_kwargs: dict, use_uv: bool, uv_path: Optional[str],
+) -> Tuple[Optional[List[str]], str]:
+    """Pins for the packages installed after torch, chosen for QGIS's NumPy.
+
+    Dry-run resolution of those packages with ``numpy==<host_version>``
+    supplied by a metadata-only stand-in wheel. Every resolved package
+    except NumPy is returned as ``name==version``; NumPy itself is left
+    free, so the plugin environment receives a NumPy that has a wheel for
+    its Python while SciPy & co. are versions that run with QGIS's NumPy.
+
+    Returns (pins, "") or (None, error output).
+    """
+    import json
+
+    specs = [f"{name}{spec}" for name, spec in _get_required_packages()
+             if name not in _TORCH_FAMILY]
+    with tempfile.TemporaryDirectory(prefix="numpy_host_") as work:
+        _write_numpy_stand_in(work, host_version)
+        requirements = os.path.join(work, "requirements.txt")
+        constraints = os.path.join(work, "constraints.txt")
+        report = os.path.join(work, "report.json")
+        with open(requirements, "w", encoding="utf-8") as f:
+            f.write("\n".join(specs) + "\n")
+        with open(constraints, "w", encoding="utf-8") as f:
+            f.write(f"numpy=={host_version}\n")
+        if use_uv:
+            cmd = [uv_path, "pip", "compile", requirements,
+                   "--python", python_path, "--constraint", constraints,
+                   "--find-links", work, "--no-header", "--no-annotate",
+                   "--quiet"]
+            cmd.extend(_get_uv_install_policy_flags())
+        else:
+            cmd = [python_path, "-m", "pip", "install", "--dry-run",
+                   "--ignore-installed", "--quiet",
+                   "--disable-pip-version-check", "--report", report,
+                   "--find-links", work, "--constraint", constraints,
+                   "--requirement", requirements]
+            cmd.extend(_get_pip_install_policy_flags())
+            cmd.extend(_get_pip_proxy_args())
+        try:
+            result = proc.run(cmd, timeout=600, env=env, **subprocess_kwargs)
+        except Exception as exc:
+            return None, str(exc)
+        if result.returncode != 0:
+            return None, (result.stderr or "") + (result.stdout or "")
+        resolved = {}
+        try:
+            if use_uv:
+                for line in result.stdout.splitlines():
+                    name, sep, version = line.strip().partition("==")
+                    if sep and not name.startswith("#"):
+                        resolved[name.strip()] = version.split(";")[0].strip()
+            else:
+                with open(report, "r", encoding="utf-8") as f:
+                    for item in json.load(f).get("install", []):
+                        meta = item.get("metadata", {})
+                        resolved[meta["name"]] = meta["version"]
+        except Exception as exc:
+            return None, f"Could not read the resolution result: {exc}"
+    pins = [f"{name}=={version}" for name, version in sorted(resolved.items())
+            if name.lower().replace("_", "-") != "numpy"]
+    if not pins:
+        return None, "The resolution returned no packages."
+    return pins, ""
+
+
+def _host_numpy_constraints(
+    venv_dir: str, python_path: str, env: dict, subprocess_kwargs: dict,
+    use_uv: bool, uv_path: Optional[str],
+) -> Tuple[List[str], str]:
+    """Constraint lines that keep the plugin environment usable with QGIS's NumPy.
+
+    Nothing for a QGIS with NumPy 2. With NumPy 1.x the environment gets
+    the same NumPy as QGIS when a wheel of it exists for the plugin's
+    Python. When none does (NumPy 1.x has no wheels for Python 3.13 and
+    later, and Linux distributions build their own versions), the
+    packages installed after torch are pinned to versions that support
+    QGIS's NumPy instead; QGIS keeps importing its own NumPy first.
+
+    Returns (lines, "") or ([], error message) when no such set exists.
+    """
+    pin = _host_numpy_pin(venv_dir)
+    if not pin:
+        return [], ""
+    host_version = pin.split("==", 1)[1]
+    installable, output = _numpy_wheel_installable(
+        pin, python_path, env, subprocess_kwargs, use_uv, uv_path)
+    if installable:
+        _log(
+            f"QGIS provides NumPy {host_version}: the plugin environment is "
+            "pinned to it so SciPy and the other compiled packages match "
+            "QGIS's NumPy.",
+            Qgis.MessageLevel.Info,
+        )
+        return [pin], ""
+    if _is_network_error(output):
+        return [], "Failed to check NumPy {}: network error".format(host_version)
+    _log(
+        f"QGIS provides NumPy {host_version}, which has no wheel for the "
+        f"plugin's Python {sys.version_info.major}.{sys.version_info.minor}. "
+        "Choosing package versions that support it.",
+        Qgis.MessageLevel.Info,
+    )
+    pins, error = _resolve_against_host_numpy(
+        host_version, venv_dir, python_path, env, subprocess_kwargs,
+        use_uv, uv_path)
+    if pins is None:
+        if _is_network_error(error):
+            return [], "Failed to resolve packages for NumPy {}: network error".format(
+                host_version)
+        return [], (
+            f"QGIS provides NumPy {host_version}, and no set of the plugin's "
+            "packages supports it on this Python. Updating QGIS (or its "
+            "NumPy) to NumPy 2 solves this. Details: " + error[:1200]
+        )
+    _log(
+        f"Packages chosen for QGIS's NumPy {host_version}: " + ", ".join(pins),
+        Qgis.MessageLevel.Info,
+    )
+    return pins, ""
+
+
+def _write_torch_constraints(
+    venv_dir: str, versions: dict, host_lines: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Write a pip/uv constraints file pinning torch and torchvision.
+
+    Every install that runs after the CUDA phase passes this file with
+    ``--constraint`` so a later resolution (the batch phase pulls in
+    ``timm``, which depends on torch) can never replace the +cuXXX build
+    with the CPU-only build PyPI publishes under the same name. The pin
+    keeps the local version segment (``2.12.0+cu126``): a bare
+    ``==2.12.0`` would still match PyPI's ``2.12.0``.
+
+    On QGIS builds whose own NumPy is 1.x the file also carries
+    ``host_lines`` from ``_host_numpy_constraints`` (when None: the exact
+    NumPy pin of ``_host_numpy_pin``).
+
+    Returns the file path, or None when there is nothing to pin.
+    """
+    pins = [
+        f"{name}=={version}"
+        for name, version in versions.items()
+        if name in ("torch", "torchvision") and version
+    ]
+    if host_lines is None:
+        host_pin = _host_numpy_pin(venv_dir)
+        host_lines = [host_pin] if host_pin else []
+    pins.extend(host_lines)
+    if not pins:
+        return None
+    path = os.path.join(venv_dir, "torch_constraints.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(pins) + "\n")
+    except Exception as exc:
+        _log(f"Could not write torch constraints file: {exc}", Qgis.MessageLevel.Warning)
+        return None
+    _log(
+        "Pinned for the rest of the install: " + ", ".join(pins),
+        Qgis.MessageLevel.Info,
+    )
+    return path
+
+
+def _is_cpu_torch_installed(
+    python_path: str, env: dict, subprocess_kwargs: dict
+) -> bool:
+    """Check if installed torch has no CUDA support (CPU-only build).
+
+    Args:
+        python_path: Path to the venv Python.
+        env: Environment dict for subprocess.
+        subprocess_kwargs: Platform-specific subprocess kwargs.
+
+    Returns:
+        True if CPU-only torch is installed.
+    """
+    try:
+        result = proc.run(
+            [python_path, "-c", "import torch; print(torch.version.cuda)"],
+            timeout=30,
+            env=env,
+            **subprocess_kwargs,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() == "None"
+    except Exception:
+        _LOG.debug("Ignored non-fatal error", exc_info=True)
+    return False
+
+
+def _spconv_build_for(cuda_index: Optional[str]) -> Optional[str]:
+    """The spconv build (``"cu126"``) installed with torch from
+    ``cuda_index``: the matching build where spconv publishes one, the
+    fallback build for cu128 (RTX 50 series), ``None`` otherwise."""
+    if cuda_index in _SPCONV_INDEXES:
+        return cuda_index
+    return _SPCONV_FALLBACK_BUILDS.get(cuda_index or "")
+
+
+def _spconv_is_fallback(cuda_index: Optional[str]) -> bool:
+    """True when the spconv build for ``cuda_index`` is older than torch's
+    toolkit: its kernels are compiled by the driver on first use."""
+    build = _spconv_build_for(cuda_index)
+    return build is not None and build != cuda_index
+
+
+def _spconv_extra_for(cuda_index: Optional[str]) -> List[str]:
+    """Distribution name(s) of the spconv build installed with ``cuda_index``."""
+    build = _spconv_build_for(cuda_index)
+    return [f"spconv-{build}"] if build else []
+
+
+# What Phase C did for spconv in the last install_dependencies() call, for
+# the install marker: build, whether it is the fallback build, and the
+# install error (None when installed). Reset at every install.
+_last_spconv_result: dict = {}
+
+
+def _install_spconv(
+    uv_path: Optional[str],
+    python_path: str,
+    venv_dir: str,
+    build: str,
+    env: dict,
+    subprocess_kwargs: dict,
+    cancel_check=None,
+) -> Tuple[bool, str]:
+    """Install (or replace) the spconv ``build`` (``"cu126"``).
+
+    Removes every other spconv / cumm variant first (the cascade may have
+    moved torch to another toolkit), then installs ``spconv-<build>``
+    under the torch constraints file when one exists, so the resolution
+    cannot touch torch. Returns ``(ok, detail)``; never raises.
+    """
+    cuda_index = build
+    if uv_path is None:
+        return False, "spconv is installed with uv only"
+    variants = [f"{name}-{idx}" for idx in _SPCONV_INDEXES + ("cu128", "cu120")
+                for name in ("spconv", "cumm")]
+    try:
+        proc.run(
+            [uv_path, "pip", "uninstall", "--python", python_path] + variants,
+            timeout=180, env=env,
+            **subprocess_kwargs,
+        )
+    except Exception as exc:
+        _log(f"spconv cleanup warning (continuing): {exc}", Qgis.MessageLevel.Warning)
+
+    cmd = [uv_path, "pip", "install", "--python", python_path]
+    cmd.extend(_get_uv_install_policy_flags())
+    constraints = os.path.join(venv_dir, "torch_constraints.txt")
+    if os.path.exists(constraints):
+        cmd.extend(["--constraint", constraints])
+    cmd.append(f"spconv-{cuda_index}")
+    try:
+        result = _run_pip_install(
+            cmd=cmd, timeout=900, env=env, subprocess_kwargs=subprocess_kwargs,
+            label=f"spconv ({cuda_index})", progress_start=99, progress_end=100,
+            progress_callback=None, cancel_check=cancel_check,
+        )
+    except Exception as exc:
+        return False, str(exc)[:300]
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "")[:300]
+    _log(f"Installed spconv-{cuda_index} for the model", Qgis.MessageLevel.Success)
+    return True, ""
+
+
+# Why the last _verify_cuda_in_venv() failed, when it can tell
+# ("no_kernels_for": the GPU architecture the installed torch lacks).
+_last_cuda_check: dict = {}
+
+
+def _verify_cuda_in_venv(venv_dir: str) -> bool:
+    """Run a CUDA smoke test inside the venv.
+
+    Args:
+        venv_dir: Path to the virtual environment.
+
+    Returns:
+        True if CUDA is functional.
+    """
+    python_path = get_venv_python_path(venv_dir)
+    env = _get_clean_env_for_venv()
+    subprocess_kwargs = _get_subprocess_kwargs()
+
+    # The architecture check comes before the first kernel: a wheel without
+    # code for this GPU (no sm_XY and no PTX it can compile) fails with an
+    # obscure "no kernel image" error, which is not a driver problem.
+    cuda_test_code = (
+        "import torch; "
+        "print('torch=' + torch.__version__); "
+        "print('cuda_built=' + str(torch.version.cuda)); "
+        "assert torch.cuda.is_available(), 'CUDA not available'; "
+        "print('device=' + torch.cuda.get_device_name(0)); "
+        "major, minor = torch.cuda.get_device_capability(0); "
+        "archs = torch.cuda.get_arch_list(); "
+        "sm = [int(a[3:]) for a in archs if a.startswith('sm_') and a[3:].isdigit()]; "
+        "ptx = [int(a[8:]) for a in archs if a.startswith('compute_') and a[8:].isdigit()]; "
+        "cap = major * 10 + minor; "
+        "ok = (not (sm or ptx) or any(s // 10 == major and s <= cap for s in sm) "
+        "or any(p <= cap for p in ptx)); "
+        "print('arch=sm_%d%d built=%s' % (major, minor, ','.join(archs))); "
+        "print('arch_ok=' + str(ok)); "
+        "assert ok, 'NO_KERNELS_FOR_GPU'; "
+        "t = torch.zeros(1, device='cuda'); "
+        "torch.cuda.synchronize(); "
+        "print('CUDA OK')"
+    )
+    _last_cuda_check.clear()
+
+    try:
+        # Retry once because CUDA initialization can be transiently slow/flaky
+        # immediately after installation on some Windows systems.
+        for attempt in (1, 2):
+            result = proc.run(
+                [python_path, "-c", cuda_test_code],
+                timeout=180 if attempt == 2 else 120,
+                env=env,
+                **subprocess_kwargs,
+            )
+            if result.returncode == 0 and "CUDA OK" in result.stdout:
+                _log(
+                    "CUDA verification passed: {}".format(
+                        result.stdout.strip()[
+                            :400]), Qgis.MessageLevel.Success, )
+                return True
+
+            out = result.stdout or ""
+            err = result.stderr or ""
+            _log(
+                "CUDA verification attempt {} failed (rc={}).\nstdout: {}\nstderr: {}".format(
+                    attempt, result.returncode, out[:400], err[:400]
+                ),
+                Qgis.MessageLevel.Warning,
+            )
+            if "NO_KERNELS_FOR_GPU" in err or "arch_ok=False" in out:
+                # Deterministic: a retry gives the same answer.
+                arch = next((line.split()[0][5:] for line in out.splitlines()
+                             if line.startswith("arch=")), "")
+                _last_cuda_check["no_kernels_for"] = arch or "this GPU"
+                return False
+            if attempt == 1:
+                time.sleep(2)
+        return False
+    except Exception as e:
+        _log(f"CUDA verification exception: {e}", Qgis.MessageLevel.Warning)
+        return False
+
+
+def _is_optional_verify_package(package_name: str) -> bool:
+    """Return True if verification failure for this package can be non-fatal.
+
+    Some packages are installed as optional feature backends and may fail to
+    import on specific platforms due to upstream native dependency issues
+    without breaking the core plugin functionality. spconv only serves the
+    the model.
+    """
+    if package_name.startswith("spconv"):
+        return False
+    if sys.platform == "win32" and package_name in ("sam3", "triton-windows"):
+        return True
+    return False
+
+
+def _is_optional_install_package(package_name: str) -> bool:
+    """Return True if install failure for this package can be non-fatal."""
+    if sys.platform == "win32" and package_name == "triton-windows":
+        return True
+    return False
+
+
+def install_dependencies(
+    venv_dir: str = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    cuda_enabled: bool = False,
+) -> Tuple[bool, str]:
+    """Install all required packages into the virtual environment.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+        progress_callback: Optional function called with (percent, message).
+        cancel_check: Optional function returning True to cancel.
+        cuda_enabled: Whether to install CUDA-enabled PyTorch.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    if not venv_exists(venv_dir):
+        return False, "Virtual environment does not exist"
+
+    from .uv_manager import get_uv_path, uv_exists
+
+    use_uv = uv_exists()
+    uv_path = get_uv_path() if use_uv else None
+    if use_uv:
+        _log(f"Installing dependencies using uv: {uv_path}", Qgis.MessageLevel.Info)
+    else:
+        pip_path = get_venv_pip_path(venv_dir)
+        _log(f"Installing dependencies using pip: {pip_path}", Qgis.MessageLevel.Info)
+    if cuda_enabled:
+        _log("CUDA mode enabled - will install GPU-accelerated PyTorch", Qgis.MessageLevel.Info)
+
+
+    required_packages = _get_required_packages()
+    base_progress = 20
+    progress_range = 80
+    python_path = get_venv_python_path(venv_dir)
+    env = _get_clean_env_for_venv()
+    subprocess_kwargs = _get_subprocess_kwargs()
+
+    # -- Partition packages into CUDA (individual) and batch groups -----------
+    cuda_packages: List[Tuple[str, str]] = []
+    batch_packages: List[Tuple[str, str]] = []
+    for pkg_name, ver_spec in required_packages:
+        if pkg_name in ("torch", "torchvision"):
+            cuda_packages.append((pkg_name, ver_spec))
+        else:
+            batch_packages.append((pkg_name, ver_spec))
+
+    # Progress allocation: CUDA phase then batch phase
+    cuda_progress_weight = 40 if cuda_packages else 0
+    cuda_start = base_progress
+    cuda_end = base_progress + int(progress_range * cuda_progress_weight / 100)
+    batch_start = cuda_end
+    batch_end = base_progress + progress_range  # == 100
+
+    # -- Phase A: CUDA packages (individual installs) -------------------------
+    _force_cuda_reinstall = False
+    selected_cuda_index: Optional[str] = None
+    # Set once torch is installed: every later install in this phase
+    # resolves under a torch pin.
+    phase_a_constraint_args: List[str] = []
+    # QGIS with its own NumPy 1.x: constrain from the first install on
+    # (torchvision already pulls NumPy in). Nothing changes elsewhere.
+    host_lines, host_error = _host_numpy_constraints(
+        venv_dir, python_path, env, subprocess_kwargs, use_uv, uv_path)
+    if host_error:
+        return False, host_error
+    if host_lines:
+        constraints_path = _write_torch_constraints(venv_dir, {}, host_lines)
+        if constraints_path:
+            phase_a_constraint_args = ["--constraint", constraints_path]
+    if cuda_packages:
+        _precheck_env = _get_clean_env_for_venv()
+        _precheck_kwargs = _get_subprocess_kwargs()
+        if _is_cpu_torch_installed(
+                python_path,
+                _precheck_env,
+                _precheck_kwargs):
+            _force_cuda_reinstall = True
+            _log(
+                "CPU torch detected in venv, CUDA packages will use "
+                "--force-reinstall",
+                Qgis.MessageLevel.Info,
+            )
+
+        num_cuda = len(cuda_packages)
+        for ci, (package_name, version_spec) in enumerate(cuda_packages):
+            if cancel_check and cancel_check():
+                _log("Installation cancelled by user", Qgis.MessageLevel.Warning)
+                return False, "Installation cancelled"
+
+            package_spec = f"{package_name}{version_spec}"
+            pkg_start = cuda_start + \
+                int((cuda_end - cuda_start) * ci / num_cuda)
+            pkg_end = cuda_start + \
+                int((cuda_end - cuda_start) * (ci + 1) / num_cuda)
+
+            if package_name == "torch":
+                label = "GPU PyTorch (~2.5 GB)"
+            else:
+                label = "{} (CUDA)".format(package_name)
+
+            # Decide CUDA index up-front so we can also apply the
+            # PyTorch-version cap that matches the selected toolkit.
+            is_cuda_package = cuda_enabled
+            _, gpu_info = detect_nvidia_gpu() if cuda_enabled else (False, {})
+            cuda_index = _select_cuda_index(gpu_info) if cuda_enabled else None
+            selected_cuda_index = cuda_index
+            if cuda_enabled and cuda_index is None:
+                return False, ("The NVIDIA driver is too old for the PyTorch GPU builds. Update it from nvidia.com and click Reinstall Dependencies, or install the CPU version (button below).")
+            if not cuda_enabled:
+                label = package_name + " (CPU/MPS)"
+
+            # When PyTorch has dropped this CUDA toolkit in newer torch
+            # releases, cap the spec so uv can't pick a newer +cpu wheel
+            # the index publishes as a fallback. The .post-release ".0"
+            # makes the upper bound exclusive of any 2.6.x prerelease.
+            effective_spec = package_spec
+            if is_cuda_package and package_name == "torch":
+                cap = _TORCH_VERSION_CAP_BY_CUDA.get(cuda_index)
+                if cap is not None:
+                    effective_spec = f"torch>=2.0.0,<{cap}"
+                    _log(
+                        "Capping torch to <{} for {} (PyTorch dropped this "
+                        "toolkit in newer torch releases; uv would otherwise "
+                        "resolve to a +cpu wheel).".format(cap, cuda_index),
+                        Qgis.MessageLevel.Info,
+                    )
+            elif package_name == "torchvision":
+                # torchvision pins an exact torch version. It is resolved
+                # under the constraints file written right after the torch
+                # install, so uv picks the torchvision that matches the
+                # installed torch. v1.0.x applied the torch cap number to
+                # torchvision instead (never binding: torchvision is 0.x),
+                # so uv took the newest torchvision on the index and, with
+                # --upgrade, replaced torch by whatever it wanted, a +cpu
+                # build on the older CUDA indexes.
+                effective_spec = "torchvision>=0.15.0"
+
+            if progress_callback:
+                progress_callback(
+                    pkg_start,
+                    "Installing PyTorch dependencies... ({}/{})".format(ci + 1, num_cuda),
+                )
+            _log("[PyTorch {}/{}] Installing {}...".format(ci +
+                 1, num_cuda, effective_spec), Qgis.MessageLevel.Info, )
+
+            # Build install args
+            if use_uv:
+                pip_args = [
+                    "pip",
+                    "install",
+                    "--python",
+                    python_path,
+                    "--upgrade",
+                ]
+                pip_args.extend(_get_uv_install_policy_flags())
+                pip_args.extend(phase_a_constraint_args)
+                pip_args.append(effective_spec)
+            else:
+                pip_args = [
+                    "install",
+                    "--upgrade",
+                    "--no-warn-script-location",
+                    "--disable-pip-version-check",
+                    "--prefer-binary",
+                ]
+                pip_args.extend(_get_pip_install_policy_flags())
+                pip_args.extend(_get_pip_proxy_args())
+                pip_args.extend(phase_a_constraint_args)
+                pip_args.append(effective_spec)
+
+            if is_cuda_package:
+                pip_args.extend(["--index-url",
+                                 "https://download.pytorch.org/whl/{}".format(cuda_index),
+                                 "--no-cache" if use_uv else "--no-cache-dir",
+                                 ])
+                _log("Using CUDA {} index for {}".format(
+                    cuda_index, package_name), Qgis.MessageLevel.Info, )
+
+            if not cuda_enabled and sys.platform != "darwin":
+                pip_args.extend(["--index-url", "https://download.pytorch.org/whl/cpu"])
+
+            # Uninstall CPU torch before CUDA install
+            if _force_cuda_reinstall and is_cuda_package:
+                _log("Uninstalling CPU {} before CUDA install".format(
+                    package_name), Qgis.MessageLevel.Info, )
+                try:
+                    if use_uv:
+                        uninstall_cmd = [
+                            uv_path,
+                            "pip",
+                            "uninstall",
+                            "--python",
+                            python_path,
+                            package_name,
+                        ]
+                    else:
+                        uninstall_cmd = [
+                            python_path,
+                            "-m",
+                            "pip",
+                            "uninstall",
+                            "-y",
+                            package_name,
+                        ]
+                    proc.run(
+                        uninstall_cmd,
+                        timeout=120,
+                        env=env,
+                        **subprocess_kwargs,
+                    )
+                except Exception as exc:
+                    _log(
+                        f"Failed to uninstall CPU {package_name}: {exc}",
+                        Qgis.MessageLevel.Warning,
+                    )
+
+            if use_uv:
+                base_cmd = [uv_path] + pip_args
+            else:
+                base_cmd = [python_path, "-m", "pip"] + pip_args
+
+            install_failed = False
+            install_error_msg = ""
+            last_returncode = None
+            pkg_timeout = 2400
+
+            try:
+                result = _run_pip_install(
+                    cmd=base_cmd,
+                    timeout=pkg_timeout,
+                    env=env,
+                    subprocess_kwargs=subprocess_kwargs,
+                    label=label,
+                    progress_start=pkg_start,
+                    progress_end=pkg_end,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
+
+                if (
+                    result.returncode == -1
+                    and "cancelled" in (result.stderr or "").lower()
+                ):
+                    return False, "Installation cancelled"
+
+                # Retry on hash mismatch
+                if result.returncode != 0:
+                    error_output = result.stderr or result.stdout or ""
+                    if _is_hash_mismatch(error_output):
+                        _log(
+                            "Hash mismatch, retrying with --no-cache...",
+                            Qgis.MessageLevel.Warning,
+                        )
+                        nocache_flag = "--no-cache" if use_uv else "--no-cache-dir"
+                        result = _run_pip_install(
+                            cmd=base_cmd + [nocache_flag],
+                            timeout=pkg_timeout,
+                            env=env,
+                            subprocess_kwargs=subprocess_kwargs,
+                            label=label,
+                            progress_start=pkg_start,
+                            progress_end=pkg_end,
+                            progress_callback=progress_callback,
+                            cancel_check=cancel_check,
+                        )
+
+                # Report certificate errors without retrying insecurely.
+                result = _retry_if_tls_error(
+                    result, base_cmd, use_uv,
+                    lambda cmd: _run_pip_install(
+                        cmd=cmd,
+                        timeout=pkg_timeout,
+                        env=env,
+                        subprocess_kwargs=subprocess_kwargs,
+                        label="{} (TLS retry)".format(label),
+                        progress_start=pkg_start,
+                        progress_end=pkg_end,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    ),
+                )
+
+                # Retry on network errors
+                if result.returncode != 0:
+                    error_output = result.stderr or result.stdout or ""
+                    if _is_network_error(error_output):
+                        for attempt in range(1, 3):
+                            _log(
+                                "Network error, retrying in 5s "
+                                "(attempt {}/2)...".format(attempt),
+                                Qgis.MessageLevel.Warning,
+                            )
+                            if progress_callback:
+                                progress_callback(
+                                    pkg_start,
+                                    "Network error, retrying {}...".format(
+                                        package_name
+                                    ),
+                                )
+                            time.sleep(5)
+                            if cancel_check and cancel_check():
+                                return False, "Installation cancelled"
+                            result = _run_pip_install(
+                                cmd=base_cmd,
+                                timeout=pkg_timeout,
+                                env=env,
+                                subprocess_kwargs=subprocess_kwargs,
+                                label=label,
+                                progress_start=pkg_start,
+                                progress_end=pkg_end,
+                                progress_callback=progress_callback,
+                                cancel_check=cancel_check,
+                            )
+                            if result.returncode == 0:
+                                break
+
+                if result.returncode == 0:
+                    _log(
+                        "Successfully installed {}".format(package_spec),
+                        Qgis.MessageLevel.Success,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            pkg_end, "{} installed".format(package_name))
+                else:
+                    error_msg = (
+                        result.stderr
+                        or result.stdout
+                        or "Return code {}".format(result.returncode)
+                    )
+                    _log(
+                        "Failed to install {}: {}".format(
+                            package_spec, error_msg[:500]
+                        ),
+                        Qgis.MessageLevel.Critical,
+                    )
+                    install_failed = True
+                    install_error_msg = error_msg
+                    last_returncode = result.returncode
+
+            except proc.TimeoutExpired:
+                _log(
+                    "Installation of {} timed out".format(package_spec),
+                    Qgis.MessageLevel.Critical,
+                )
+                install_failed = True
+                install_error_msg = "Installation of {} timed out".format(
+                    package_name)
+            except Exception as e:
+                _log(
+                    "Exception installing {}: {}".format(package_spec, e),
+                    Qgis.MessageLevel.Critical,
+                )
+                install_failed = True
+                install_error_msg = "Error installing {}: {}".format(
+                    package_name, str(e)[:200]
+                )
+
+            if install_failed:
+                _log(
+                    "pip error output: {}".format(install_error_msg[:2000]),
+                    Qgis.MessageLevel.Critical,
+                )
+                if _is_ssl_error(install_error_msg):
+                    return (
+                        False,
+                        "Failed to install {}: SSL certificate error".format(
+                            package_name
+                        ),
+                    )
+                if _is_proxy_auth_error(install_error_msg):
+                    return (
+                        False,
+                        "Failed to install {}: proxy authentication "
+                        "required".format(package_name),
+                    )
+                if _is_network_error(install_error_msg):
+                    return (
+                        False, "Failed to install {}: network error".format(package_name), )
+                if _is_corrupted_venv_error(install_error_msg):
+                    return False, _format_corrupted_venv_help()
+                if _is_application_control_error(install_error_msg):
+                    return False, _format_application_control_help()
+                if _is_antivirus_error(install_error_msg):
+                    return False, _format_antivirus_help(package_name)
+                if _is_access_denied_error(install_error_msg):
+                    return False, _format_access_denied_help(package_name)
+                if last_returncode is not None and _is_windows_process_crash(
+                    last_returncode
+                ):
+                    return (
+                        False,
+                        "Failed to install {}: process crashed "
+                        "(code {})".format(package_name, last_returncode),
+                    )
+                return (
+                    False,
+                    "Failed to install {}: {}".format(
+                        package_name, install_error_msg[:1500]
+                    ),
+                )
+
+            # Pin the selected torch build so torchvision and
+            # every later resolution keep this exact build.
+            if package_name == "torch":
+                installed = _get_installed_versions(
+                    python_path, ("torch",), env, subprocess_kwargs,
+                )
+                constraints_path = _write_torch_constraints(venv_dir, installed, host_lines)
+                if constraints_path:
+                    phase_a_constraint_args = ["--constraint", constraints_path]
+
+    # -- Phase B: Batch install remaining packages ----------------------------
+    if batch_packages:
+        if cancel_check and cancel_check():
+            _log("Installation cancelled by user", Qgis.MessageLevel.Warning)
+            return False, "Installation cancelled"
+
+        batch_specs = ["{}{}".format(name, ver)
+                       for name, ver in batch_packages]
+        _log(
+            "Installing {} packages in batch: {}".format(
+                len(batch_specs), ", ".join(batch_specs)
+            ),
+            Qgis.MessageLevel.Info,
+        )
+        if progress_callback:
+            progress_callback(batch_start, "Installing dependencies...")
+
+        # Pin the torch build the CUDA phase installed. ``timm`` depends
+        # on torch and torchvision, so this resolution would otherwise be
+        # free to replace the +cuXXX wheels with the CPU-only build PyPI
+        # publishes under the same name (it did exactly that as soon as
+        # PyPI moved past the version the CUDA index offered). No
+        # ``--upgrade`` here either: the venv is freshly created, there
+        # is nothing to upgrade, and with uv the flag re-resolves every
+        # package in the graph instead of only the ones named.
+        constraint_args: List[str] = []
+        if cuda_packages:
+            installed = _get_installed_versions(
+                python_path, ("torch", "torchvision"), env, subprocess_kwargs
+            )
+            constraints_path = _write_torch_constraints(venv_dir, installed, host_lines)
+            if constraints_path:
+                constraint_args = ["--constraint", constraints_path]
+            if not installed.get("torch"):
+                _log(
+                    "torch is not installed after the CUDA phase; the batch "
+                    "install runs without a torch pin.",
+                    Qgis.MessageLevel.Warning,
+                )
+
+        if use_uv:
+            pip_args = [
+                "pip",
+                "install",
+                "--python",
+                python_path,
+            ]
+            pip_args.extend(_get_uv_install_policy_flags())
+            pip_args.extend(constraint_args)
+            pip_args.extend(batch_specs)
+            base_cmd = [uv_path] + pip_args
+        else:
+            pip_args = [
+                "install",
+                "--no-warn-script-location",
+                "--disable-pip-version-check",
+                "--prefer-binary",
+            ]
+            pip_args.extend(_get_pip_install_policy_flags())
+            pip_args.extend(_get_pip_proxy_args())
+            pip_args.extend(constraint_args)
+            pip_args.extend(batch_specs)
+            base_cmd = [python_path, "-m", "pip"] + pip_args
+
+        batch_timeout = 3600  # 60 min for entire batch
+
+        try:
+            result = _run_pip_install(
+                cmd=base_cmd,
+                timeout=batch_timeout,
+                env=env,
+                subprocess_kwargs=subprocess_kwargs,
+                label="dependencies",
+                progress_start=batch_start,
+                progress_end=batch_end,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+
+            if result.returncode == - \
+                    1 and "cancelled" in (result.stderr or "").lower():
+                return False, "Installation cancelled"
+
+            # Retry on hash mismatch
+            if result.returncode != 0:
+                error_output = result.stderr or result.stdout or ""
+                if _is_hash_mismatch(error_output):
+                    _log(
+                        "Hash mismatch, retrying batch with --no-cache...",
+                        Qgis.MessageLevel.Warning,
+                    )
+                    nocache_flag = "--no-cache" if use_uv else "--no-cache-dir"
+                    result = _run_pip_install(
+                        cmd=base_cmd + [nocache_flag],
+                        timeout=batch_timeout,
+                        env=env,
+                        subprocess_kwargs=subprocess_kwargs,
+                        label="dependencies (no-cache retry)",
+                        progress_start=batch_start,
+                        progress_end=batch_end,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    )
+
+            # Retry on TLS errors (corporate SSL inspection), see Phase A.
+            result = _retry_if_tls_error(
+                result, base_cmd, use_uv,
+                lambda cmd: _run_pip_install(
+                    cmd=cmd,
+                    timeout=batch_timeout,
+                    env=env,
+                    subprocess_kwargs=subprocess_kwargs,
+                    label="dependencies (TLS retry)",
+                    progress_start=batch_start,
+                    progress_end=batch_end,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                ),
+            )
+
+            # Retry on network errors
+            if result.returncode != 0:
+                error_output = result.stderr or result.stdout or ""
+                if _is_network_error(error_output):
+                    for attempt in range(1, 3):
+                        _log(
+                            "Network error, retrying batch in 5s "
+                            "(attempt {}/2)...".format(attempt),
+                            Qgis.MessageLevel.Warning,
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                batch_start,
+                                "Network error, retrying...",
+                            )
+                        time.sleep(5)
+                        if cancel_check and cancel_check():
+                            return False, "Installation cancelled"
+                        result = _run_pip_install(
+                            cmd=base_cmd,
+                            timeout=batch_timeout,
+                            env=env,
+                            subprocess_kwargs=subprocess_kwargs,
+                            label="dependencies (retry {})".format(attempt),
+                            progress_start=batch_start,
+                            progress_end=batch_end,
+                            progress_callback=progress_callback,
+                            cancel_check=cancel_check,
+                        )
+                        if result.returncode == 0:
+                            break
+
+            # If batch failed, check if an optional package caused it
+            if result.returncode != 0:
+                error_output = result.stderr or result.stdout or ""
+                failed_pkg = _classify_batch_error(error_output, batch_specs)
+                if failed_pkg and _is_optional_install_package(failed_pkg):
+                    _log(
+                        "Optional package {} failed in batch; "
+                        "retrying without it...".format(failed_pkg),
+                        Qgis.MessageLevel.Warning,
+                    )
+                    retry_specs = [
+                        s for s in batch_specs if not s.startswith(failed_pkg)
+                    ]
+                    if retry_specs:
+                        if use_uv:
+                            retry_args = [
+                                "pip",
+                                "install",
+                                "--python",
+                                python_path,
+                            ]
+                            retry_args.extend(_get_uv_install_policy_flags())
+                            retry_args.extend(constraint_args)
+                            retry_args.extend(retry_specs)
+                            retry_cmd = [uv_path] + retry_args
+                        else:
+                            retry_args = [
+                                "install",
+                                "--no-warn-script-location",
+                                "--disable-pip-version-check",
+                                "--prefer-binary",
+                            ]
+                            retry_args.extend(_get_pip_install_policy_flags())
+                            retry_args.extend(_get_pip_proxy_args())
+                            retry_args.extend(constraint_args)
+                            retry_args.extend(retry_specs)
+                            retry_cmd = [
+                                python_path,
+                                "-m",
+                                "pip",
+                            ] + retry_args
+
+                        result = _run_pip_install(
+                            cmd=retry_cmd,
+                            timeout=batch_timeout,
+                            env=env,
+                            subprocess_kwargs=subprocess_kwargs,
+                            label="dependencies (without {})".format(failed_pkg),
+                            progress_start=batch_start,
+                            progress_end=batch_end,
+                            progress_callback=progress_callback,
+                            cancel_check=cancel_check,
+                        )
+                        if result.returncode == 0:
+                            _log(
+                                "Batch succeeded without optional "
+                                "package {}".format(failed_pkg),
+                                Qgis.MessageLevel.Warning,
+                            )
+
+            if result.returncode == 0:
+                _log("Batch install succeeded for all packages", Qgis.MessageLevel.Success)
+                if progress_callback:
+                    progress_callback(batch_end, "All dependencies installed")
+            else:
+                error_output = result.stderr or result.stdout or ""
+                failed_pkg = (
+                    _classify_batch_error(
+                        error_output,
+                        batch_specs) or "dependencies")
+                _log(
+                    "Batch install failed: {}".format(error_output[:500]),
+                    Qgis.MessageLevel.Critical,
+                )
+                if _is_ssl_error(error_output):
+                    return (
+                        False,
+                        "Failed to install {}: SSL certificate "
+                        "error".format(failed_pkg),
+                    )
+                if _is_proxy_auth_error(error_output):
+                    return (
+                        False,
+                        "Failed to install {}: proxy authentication "
+                        "required".format(failed_pkg),
+                    )
+                if _is_network_error(error_output):
+                    return (
+                        False, "Failed to install {}: network error".format(failed_pkg), )
+                if _is_corrupted_venv_error(error_output):
+                    return False, _format_corrupted_venv_help()
+                if _is_application_control_error(error_output):
+                    return False, _format_application_control_help()
+                if _is_antivirus_error(error_output):
+                    return False, _format_antivirus_help(failed_pkg)
+                if _is_access_denied_error(error_output):
+                    return False, _format_access_denied_help(failed_pkg)
+                if result.returncode is not None and _is_windows_process_crash(
+                    result.returncode
+                ):
+                    return (
+                        False,
+                        "Failed to install {}: process crashed "
+                        "(code {})".format(failed_pkg, result.returncode),
+                    )
+                return (False, "Failed to install {}: {}".format(
+                    failed_pkg, error_output[:200]), )
+
+        except proc.TimeoutExpired:
+            _log("Batch install timed out", Qgis.MessageLevel.Critical)
+            return False, "Dependency installation timed out"
+        except Exception as e:
+            _log("Exception during batch install: {}".format(e), Qgis.MessageLevel.Critical)
+            return False, "Error installing dependencies: {}".format(str(e)[
+                                                                     :200])
+
+    # -- Phase C: spconv for the LitePT-L model (CUDA installs only) ----------
+    # One distribution per CUDA toolkit: the build matching torch's toolkit
+    # where spconv publishes one (required: a failed install must not be
+    # stamped ready), the cu126 build on the cu128 torch of RTX 50 GPUs
+    # (the driver compiles its PTX on first use; optional, so that Setup
+    # still completes and the dock explains what is missing if this path
+    # fails). Kept out of the batch.
+    _last_spconv_result.clear()
+    if cuda_enabled and cuda_packages:
+        if cancel_check and cancel_check():
+            _log("Installation cancelled by user", Qgis.MessageLevel.Warning)
+            return False, "Installation cancelled"
+        spconv_build = _spconv_build_for(selected_cuda_index)
+        if spconv_build is not None:
+            fallback = _spconv_is_fallback(selected_cuda_index)
+            if fallback:
+                _log(
+                    f"No spconv wheel for {selected_cuda_index}: installing "
+                    f"spconv-{spconv_build}, whose kernels the NVIDIA driver "
+                    "compiles for this GPU the first time the model runs.",
+                    Qgis.MessageLevel.Info,
+                )
+            if progress_callback:
+                progress_callback(99, "Installing spconv (model library)...")
+            ok, detail = _install_spconv(
+                uv_path if use_uv else None, python_path, venv_dir,
+                spconv_build, env, subprocess_kwargs,
+                cancel_check=cancel_check,
+            )
+            _last_spconv_result.update(
+                build=spconv_build, fallback=fallback, error=None if ok else detail)
+            if not ok and not fallback:
+                return False, (f"The GPU library the model needs (spconv) could not be installed: {detail}. Click Reinstall Dependencies to retry.")
+            if not ok:
+                _log(
+                    f"spconv-{spconv_build} could not be installed ({detail}); the "
+                    "model cannot run on this GPU until it is (Repair dependencies).",
+                    Qgis.MessageLevel.Warning,
+                )
+        elif selected_cuda_index is not None:
+            _log(
+                f"No spconv wheel for {selected_cuda_index}; the "
+                "model cannot run on this GPU.",
+                Qgis.MessageLevel.Warning,
+            )
+
+    if progress_callback:
+        progress_callback(100, "All dependencies installed")
+
+    _log("=" * 50, Qgis.MessageLevel.Success)
+    _log("All dependencies installed successfully!", Qgis.MessageLevel.Success)
+    _log(f"Virtual environment: {venv_dir}", Qgis.MessageLevel.Success)
+    _log("=" * 50, Qgis.MessageLevel.Success)
+
+    # The install marker is written by create_venv_and_install() once
+    # verification and the final cancellation check are complete.
+
+    return True, "All dependencies installed successfully"
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+
+def _get_verification_timeout(package_name: str) -> int:
+    """Get verification timeout for a package.
+
+    Args:
+        package_name: The package name.
+
+    Returns:
+        Timeout in seconds.
+    """
+    if package_name == "torch":
+        return 120
+    if package_name == "torchvision":
+        return 120
+    return 60
+
+
+def _get_verification_code(package_name: str) -> str:
+    """Get the snippet to import-and-print a package in the venv.
+
+    The return value is passed to ``python -c <code>`` so each
+    package's import path must be expressed by its actual Python name
+    (e.g. ``numpy_indexed`` not ``numpy-indexed``).
+    """
+    if package_name == "torch":
+        return "import torch; t = torch.tensor([1, 2, 3]); print(t.sum())"
+    if package_name == "torchvision":
+        return "import torchvision; print(torchvision.__version__)"
+    if package_name == "laspy":
+        return "import laspy; print(laspy.__version__)"
+    if package_name == "lazrs":
+        return "import lazrs; print('ok')"
+    if package_name == "timm":
+        return "import timm; print(timm.__version__)"
+    if package_name == "numpy_indexed":
+        return "import numpy_indexed; print('ok')"
+    if package_name == "numpy":
+        return "import numpy; print(numpy.__version__)"
+    if package_name == "scipy":
+        return "import scipy.spatial; print(scipy.__version__)"
+    if package_name.startswith("spconv"):
+        # Distribution spconv-cuXXX, import name spconv.
+        return "import spconv.pytorch; print(spconv.__version__)"
+    if package_name == "requests":
+        return "import requests; print(requests.__version__)"
+    # Fallback: best-effort import using PEP 503 -> module name.
+    import_name = package_name.replace("-", "_")
+    return f"import {import_name}; print('ok')"
+
+
+def verify_venv(
+    venv_dir: str = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    extra_packages: Optional[List[str]] = None,
+    optional_packages: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
+    """Verify all required packages are importable in the venv.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+        progress_callback: Optional function called with (percent, message).
+        extra_packages: Distribution names installed on top of the
+            required list (spconv for the CUDA build in use). A failure
+            fails the verification like any required package.
+        optional_packages: Names among the verified packages whose
+            failure is logged and reported in the message instead of
+            failing the verification (spconv's fallback build on RTX 50
+            GPUs: Setup must still complete, the dock then explains).
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+    optional_set = set(optional_packages or [])
+
+    def optional(name: str) -> bool:
+        return name in optional_set or _is_optional_verify_package(name)
+
+    if not venv_exists(venv_dir):
+        return False, "Virtual environment not found"
+
+    python_path = get_venv_python_path(venv_dir)
+    env = _get_clean_env_for_venv()
+    subprocess_kwargs = _get_subprocess_kwargs()
+
+    required_packages = _get_required_packages() + [
+        (name, "") for name in (extra_packages or [])
+    ]
+    total_packages = len(required_packages)
+    optional_failures: List[str] = []
+    for i, (package_name, _) in enumerate(required_packages):
+        if progress_callback:
+            percent = int((i / total_packages) * 100)
+            progress_callback(
+                percent,
+                f"Verifying {package_name}... ({i + 1}/{total_packages})",
+            )
+
+        verify_code = _get_verification_code(package_name)
+        cmd = [python_path, "-c", verify_code]
+        pkg_timeout = _get_verification_timeout(package_name)
+
+        try:
+            result = proc.run(
+                cmd,
+                timeout=pkg_timeout,
+                env=env,
+                **subprocess_kwargs,
+            )
+
+            if result.returncode != 0:
+                error_detail = (
+                    result.stderr[:300] if result.stderr else result.stdout[:300]
+                )
+                _log(
+                    "Package {} verification failed: {}".format(
+                        package_name, error_detail
+                    ),
+                    Qgis.MessageLevel.Warning,
+                )
+                if optional(package_name):
+                    _log(
+                        "Package {} verification failed but is optional on this "
+                        "platform; continuing.".format(package_name), Qgis.MessageLevel.Warning, )
+                    optional_failures.append(package_name)
+                    continue
+                return False, "Package {} is broken: {}".format(
+                    package_name, error_detail[:200]
+                )
+
+        except proc.TimeoutExpired:
+            _log(
+                "Verification of {} timed out ({}s), retrying...".format(
+                    package_name, pkg_timeout
+                ),
+                Qgis.MessageLevel.Info,
+            )
+            try:
+                result = proc.run(
+                    cmd,
+                    timeout=pkg_timeout,
+                    env=env,
+                    **subprocess_kwargs,
+                )
+                if result.returncode != 0:
+                    error_detail = (
+                        result.stderr[:300] if result.stderr else result.stdout[:300]
+                    )
+                    if optional(package_name):
+                        _log(
+                            "Package {} verification failed on retry but is optional "
+                            "on this platform; continuing.".format(package_name), Qgis.MessageLevel.Warning, )
+                        optional_failures.append(package_name)
+                        continue
+                    return False, "Package {} is broken: {}".format(
+                        package_name, error_detail[:200]
+                    )
+            except proc.TimeoutExpired:
+                if optional(package_name):
+                    _log(
+                        "Verification of {} timed out but package is optional on "
+                        "this platform; continuing.".format(package_name), Qgis.MessageLevel.Warning, )
+                    optional_failures.append(package_name)
+                    continue
+                return False, "Verification error: {} (timed out)".format(
+                    package_name)
+            except Exception as e:
+                if optional(package_name):
+                    _log(
+                        "Verification error for {} but package is optional on this "
+                        "platform; continuing: {}".format(
+                            package_name, str(e)[
+                                :120]), Qgis.MessageLevel.Warning, )
+                    optional_failures.append(package_name)
+                    continue
+                return False, "Verification error: {} ({})".format(
+                    package_name, str(e)[:100]
+                )
+
+        except Exception as e:
+            _log(
+                "Failed to verify {}: {}".format(package_name, str(e)),
+                Qgis.MessageLevel.Warning,
+            )
+            return False, "Verification error: {}".format(package_name)
+
+    if progress_callback:
+        progress_callback(100, "Verification complete")
+
+    if optional_failures:
+        unique_optional = sorted(set(optional_failures))
+        _log(
+            "Virtual environment verified with optional package failures: {}".format(
+                ", ".join(unique_optional)
+            ),
+            Qgis.MessageLevel.Warning,
+        )
+        return (
+            True,
+            "Virtual environment ready (optional packages unavailable: {})".format(
+                ", ".join(unique_optional)),
+        )
+
+    _log("Virtual environment verified successfully", Qgis.MessageLevel.Success)
+    return True, "Virtual environment ready"
+
+
+# ---------------------------------------------------------------------------
+# Cleanup helpers
+# ---------------------------------------------------------------------------
+
+
+def cleanup_old_venv_directories() -> List[str]:
+    """Remove the stale environments of other Python versions.
+
+    Several QGIS installs (an LTR and a newer release, a Flatpak and a
+    distribution package) can share the plugin's folder with different
+    Python versions; each has its own ``venv_py3.X``. An environment with a
+    current install marker is in use by such an install and is kept. Only
+    environments without a marker or with an older install schema (built
+    by an earlier release, rebuilt anyway at their next use) are removed.
+    Called after the current environment is ready, never before.
+
+    Returns:
+        List of removed directory paths.
+    """
+    current_venv_name = f"venv_{PYTHON_VERSION}"
+    removed = []
+
+    try:
+        if not os.path.exists(CACHE_DIR):
+            return removed
+        for entry in os.listdir(CACHE_DIR):
+            entry_cmp = os.path.normcase(entry)
+            current_cmp = os.path.normcase(current_venv_name)
+            if (
+                entry_cmp.startswith(os.path.normcase("venv_py"))
+                and entry_cmp != current_cmp
+            ):
+                old_path = os.path.join(CACHE_DIR, entry)
+                marker = _read_install_marker(old_path) if os.path.isdir(old_path) else None
+                if marker is not None and marker.get(
+                        "install_schema_version") == _INSTALL_SCHEMA_VERSION:
+                    _log(f"Kept the environment of another Python version: {old_path}",
+                         Qgis.MessageLevel.Info)
+                    continue
+                if os.path.isdir(old_path):
+                    try:
+                        shutil.rmtree(old_path)
+                        _log(f"Cleaned up old venv: {old_path}", Qgis.MessageLevel.Info)
+                        removed.append(old_path)
+                    except Exception as e:
+                        _log(
+                            f"Failed to remove old venv {old_path}: {e}",
+                            Qgis.MessageLevel.Warning,
+                        )
+    except Exception as e:
+        _log(f"Error scanning for old venvs: {e}", Qgis.MessageLevel.Warning)
+
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Quick check & status
+# ---------------------------------------------------------------------------
+
+
+def _quick_check_packages(venv_dir: str = None) -> Tuple[bool, str]:
+    """Fast filesystem check that packages exist in site-packages.
+
+    Does NOT spawn subprocesses -- safe for the main thread.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+
+    Returns:
+        Tuple of (packages_found, message).
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    site_packages = get_venv_site_packages(venv_dir)
+    if not os.path.exists(site_packages):
+        return False, "site-packages directory not found"
+
+    # Fast sanity check: we only look for the two heaviest packages
+    # (torch + torchvision). If those landed, the rest of pip's
+    # resolved environment landed too. Smaller pure-Python packages
+    # (lazrs, numpy_indexed) sometimes ship a .pyd / .so alongside
+    # the package directory in ways that make a directory-only check
+    # flaky on Windows. Full verification (import-each-package)
+    # happens in verify_venv after install; this fast check just
+    # needs to detect "no install at all".
+    package_markers = {
+        "torch": "torch",
+        "torchvision": "torchvision",
+    }
+
+    for package_name, dir_name in package_markers.items():
+        pkg_dir = os.path.join(site_packages, dir_name)
+        if not os.path.exists(pkg_dir):
+            _log("Quick check: {} not found at {}".format(
+                package_name, pkg_dir), Qgis.MessageLevel.Warning, )
+            return False, "Package {} not found".format(package_name)
+
+    _log(
+        "Quick check: all packages found in {}".format(site_packages),
+        Qgis.MessageLevel.Info,
+    )
+    return True, "All packages found"
+
+
+_INSTALL_MARKER_FILENAME = ".plugin_install_marker.json"
+
+
+def _get_install_marker_path(venv_dir: str = None) -> str:
+    """Path to the JSON marker file written by the install pipeline.
+
+    The marker records which plugin version built this venv. We use it
+    on every dependency check to decide whether the venv is fresh
+    enough to trust, or whether the user just upgraded from a plugin
+    version with known bugs (in which case the venv on disk was built
+    by the buggy code and needs to be torn down and recreated).
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+    return os.path.join(venv_dir, _INSTALL_MARKER_FILENAME)
+
+
+def _write_install_marker(
+    venv_dir: str = None, extra: Optional[dict] = None,
+) -> None:
+    """Stamp the venv with the install-schema version and a timestamp.
+
+    The ``install_schema_version`` field is the value that
+    ``get_venv_status`` compares against ``_INSTALL_SCHEMA_VERSION`` to
+    decide whether the venv was built by a plugin release whose
+    install pipeline is still current. ``plugin_version`` is kept for
+    diagnostic purposes only - it is NOT used for the freshness
+    comparison, otherwise every minor plugin bump would force users to
+    re-download multi-GB of dependencies for no install-side benefit.
+
+    ``extra`` adds informational fields (installed torch version, CUDA
+    index, CUDA mode) that later releases can use to install only what
+    a new model needs instead of rebuilding the whole venv.
+
+    Best-effort: failure to write the marker is logged but does not
+    fail the install. The next dependency check then sees a missing
+    marker and triggers a reinstall - which is the safe behavior.
+    """
+    import json
+
+    try:
+        from ..config import PLUGIN_VERSION
+    except Exception:
+        PLUGIN_VERSION = "unknown"
+
+    marker_path = _get_install_marker_path(venv_dir)
+    payload = {
+        "install_schema_version": _INSTALL_SCHEMA_VERSION,
+        "plugin_version": PLUGIN_VERSION,
+        "cuda_logic_version": _CUDA_LOGIC_VERSION,
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if extra:
+        payload.update(extra)
+    try:
+        with open(marker_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        _log(f"Wrote install marker: {payload}", Qgis.MessageLevel.Info)
+    except Exception as exc:
+        _log(f"Could not write install marker: {exc}", Qgis.MessageLevel.Warning)
+
+
+def _read_install_marker(venv_dir: str = None) -> Optional[dict]:
+    """Return the parsed marker dict, or None if missing / unreadable."""
+    import json
+
+    marker_path = _get_install_marker_path(venv_dir)
+    if not os.path.exists(marker_path):
+        return None
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def get_venv_status() -> Tuple[bool, str]:
+    """Get the status of the complete installation.
+
+    Performs a quick filesystem check (no subprocess calls).
+    Safe to call from the main thread.
+
+    Returns:
+        Tuple of (is_ready, message).
+    """
+    from .python_manager import get_python_full_version, standalone_python_exists
+
+    if not standalone_python_exists():
+        # Also check for QGIS Python fallback on Windows or system Python
+        # fallback on Linux
+        if (
+            sys.platform == "win32" or sys.platform.startswith("linux")
+        ) and venv_exists():
+            pass  # venv was created with fallback Python
+        else:
+            _log("get_venv_status: standalone Python not found", Qgis.MessageLevel.Info)
+            return False, "Dependencies not installed"
+
+    if not venv_exists():
+        _log(f"get_venv_status: venv not found at {VENV_DIR}", Qgis.MessageLevel.Info)
+        return False, "Virtual environment not configured"
+
+    # Install-pipeline freshness check: if the marker is missing or
+    # was written by a plugin release whose install pipeline was
+    # different (different venv flags, different CUDA cascade, etc.),
+    # the venv on disk is potentially broken in ways that the running
+    # plugin code cannot diagnose at runtime. Force the Setup dock to
+    # reopen with a one-click Reinstall so the venv gets rebuilt.
+    #
+    # The comparison key is _INSTALL_SCHEMA_VERSION, NOT
+    # PLUGIN_VERSION. Bumping the plugin version without changing the
+    # install pipeline (e.g. a UI-only patch release) does NOT force
+    # users to redownload 1-3 GB of wheels.
+    marker = _read_install_marker()
+    if marker is None:
+        _log(
+            "get_venv_status: no install marker - venv was built by a "
+            "plugin release that pre-dates the marker (typically "
+            "v1.0.0). Triggering reinstall so the install-pipeline "
+            "fixes in newer releases apply.",
+            Qgis.MessageLevel.Warning,
+        )
+        return False, (
+            "An older version of the plugin built this environment. "
+            "Please click Reinstall Dependencies to rebuild it with "
+            "the current install code."
+        )
+
+    marker_schema = marker.get("install_schema_version")
+    if marker_schema != _INSTALL_SCHEMA_VERSION:
+        marker_plugin = marker.get("plugin_version", "unknown")
+        _log(
+            f"get_venv_status: install marker says venv was built with "
+            f"install-schema {marker_schema!r} (plugin {marker_plugin}), "
+            f"but the running plugin uses install-schema "
+            f"{_INSTALL_SCHEMA_VERSION!r}. Triggering reinstall.",
+            Qgis.MessageLevel.Warning,
+        )
+        return False, (
+            f"This environment was built by an older install pipeline "
+            f"(plugin {marker_plugin}). Please click Reinstall "
+            f"Dependencies so the current pipeline rebuilds it."
+        )
+
+    is_present, msg = _quick_check_packages()
+    if not is_present:
+        _log(f"get_venv_status: quick check failed: {msg}", Qgis.MessageLevel.Warning)
+        return False, "Virtual environment incomplete: {}".format(msg)
+
+    # Packages a newer plugin release installs on top of an environment
+    # this release still accepts (spconv's fallback build for RTX 50 GPUs,
+    # added in 1.3.2). They are added to the existing environment by
+    # complete_venv_packages(); nothing is rebuilt.
+    missing = missing_venv_packages(marker)
+    if missing:
+        _log(
+            f"get_venv_status: environment lacks {', '.join(missing)} for "
+            f"torch {marker.get('cuda_index')}; completion needed.",
+            Qgis.MessageLevel.Info,
+        )
+        return False, completion_message(missing)
+
+    # Hash mismatch is informational only - the venv has torch +
+    # torchvision (verified above); the user installed the plugin and
+    # the wheels are on disk. If REQUIRED_PACKAGES changed in a later
+    # plugin release we just rewrite the hash so the message goes away.
+    # We don't force a reinstall (the user has working torch already).
+    stored_hash = _read_deps_hash()
+    current_hash = _compute_deps_hash()
+    if stored_hash is None:
+        _log(
+            "get_venv_status: no deps hash file - writing current hash",
+            Qgis.MessageLevel.Info,
+        )
+        _write_deps_hash()
+    elif stored_hash != current_hash:
+        _log(
+            "get_venv_status: deps hash drifted "
+            f"(stored={stored_hash[:8]}..., current={current_hash[:8]}...) "
+            "- rewriting silently, treating venv as ready",
+            Qgis.MessageLevel.Info,
+        )
+        _write_deps_hash()
+
+    python_version = get_python_full_version()
+    _log("get_venv_status: ready (quick check passed)", Qgis.MessageLevel.Success)
+    return True, "Ready (Python {})".format(python_version)
+
+
+def missing_venv_packages(marker: Optional[dict] = None) -> List[str]:
+    """Distribution names this release installs that the environment lacks.
+
+    Only spconv's fallback build so far: an environment set up for a cu128
+    torch (RTX 50 series) by a release before 1.3.2 has no spconv. The
+    attempt is recorded in the marker (``spconv_build``) whether it
+    succeeded or not, so a failed attempt is reported by the LitePT status
+    instead of asking again at every start.
+    """
+    if marker is None:
+        marker = _read_install_marker()
+    if not marker or marker.get("cuda_mode") != "cuda":
+        return []
+    if "spconv_build" in marker:
+        return []
+    expected = _spconv_extra_for(marker.get("cuda_index"))
+    installed = {str(name).lower() for name in (marker.get("packages") or [])}
+    return [name for name in expected if name.lower() not in installed]
+
+
+def spconv_retry_pending(marker: Optional[dict] = None) -> List[str]:
+    """spconv build(s) whose installation failed in an earlier attempt
+    (``spconv_error`` in the marker), for a retry that only adds them."""
+    if marker is None:
+        marker = _read_install_marker()
+    if not marker or marker.get("cuda_mode") != "cuda" or not marker.get("spconv_error"):
+        return []
+    expected = _spconv_extra_for(marker.get("cuda_index"))
+    installed = {str(name).lower() for name in (marker.get("packages") or [])}
+    return [name for name in expected if name.lower() not in installed]
+
+
+def venv_completion_pending() -> bool:
+    """True when the environment only lacks packages that
+    ``complete_venv_packages`` adds (no rebuild needed): packages a newer
+    release installs, or a spconv build whose earlier attempt failed."""
+    marker = _read_install_marker()
+    if marker is None or marker.get("install_schema_version") != _INSTALL_SCHEMA_VERSION:
+        return False
+    return bool(missing_venv_packages(marker) or spconv_retry_pending(marker))
+
+
+def completion_status_message() -> str:
+    """What the Setup panel says when it offers complete_venv_packages."""
+    marker = _read_install_marker() or {}
+    missing = missing_venv_packages(marker)
+    if missing:
+        return completion_message(missing)
+    retry = spconv_retry_pending(marker)
+    if retry:
+        error = str(marker.get("spconv_error") or "")[:160]
+        return (
+            f"An earlier attempt to add {', '.join(retry)} failed ({error}). Click the "
+            "button to try again: only spconv is downloaded; PyTorch and the other "
+            "packages are kept.")
+    return ""
+
+
+def completion_message(missing: List[str]) -> str:
+    return (
+        "This environment was set up before the plugin could install "
+        f"{', '.join(missing)} for this GPU (RTX 50 series). Click the button "
+        "to add it to the existing environment; PyTorch and the other packages "
+        "are kept."
+    )
+
+
+def complete_venv_packages(
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Tuple[bool, str]:
+    """Add the packages ``missing_venv_packages`` reports to the existing
+    environment and update the install marker. Nothing else is touched:
+    the torch constraints file keeps the resolution away from torch.
+
+    Returns ``(ok, message)``. A failed attempt is recorded in the marker
+    (``spconv_error``) so the environment counts as ready for the models
+    that do not need the package; Reinstall Dependencies remains the way
+    to retry from scratch.
+    """
+    from .uv_manager import download_uv, get_uv_path, uv_exists
+
+    marker = _read_install_marker() or {}
+    missing = missing_venv_packages(marker) or spconv_retry_pending(marker)
+    if not missing:
+        return True, "Virtual environment ready"
+    if not uv_exists():
+        # spconv is installed with uv only; a failed uv download during
+        # Setup is why some environments lack it.
+        uv_ok, uv_msg = download_uv(cancel_check=cancel_check)
+        if not uv_ok:
+            _log(f"uv download failed: {uv_msg}", Qgis.MessageLevel.Warning)
+    build = _spconv_build_for(marker.get("cuda_index"))
+    if build is None:
+        return True, "Virtual environment ready"
+
+    def report(percent: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(percent, message)
+
+    python_path = get_venv_python_path(VENV_DIR)
+    env = _get_clean_env_for_venv()
+    subprocess_kwargs = _get_subprocess_kwargs()
+    report(5, f"Adding spconv-{build} to the existing environment...")
+    _log(
+        f"Completing the environment with spconv-{build} for torch "
+        f"{marker.get('cuda_index')} (RTX 50 series); nothing is rebuilt.",
+        Qgis.MessageLevel.Info,
+    )
+    ok, detail = _install_spconv(
+        get_uv_path() if uv_exists() else None, python_path, VENV_DIR,
+        build, env, subprocess_kwargs, cancel_check=cancel_check,
+    )
+    if cancel_check and cancel_check():
+        return False, "Installation cancelled"
+    error: Optional[str] = None if ok else detail
+    if ok:
+        report(80, f"Verifying spconv-{build}...")
+        try:
+            result = proc.run(
+                [python_path, "-c", _get_verification_code(f"spconv-{build}")],
+                timeout=_get_verification_timeout(f"spconv-{build}"),
+                env=env, **subprocess_kwargs,
+            )
+            if result.returncode != 0:
+                error = (result.stderr or result.stdout or "import failed")[:300]
+        except Exception as exc:
+            error = str(exc)[:300]
+    versions = _get_installed_versions(
+        python_path, [f"spconv-{build}"], env, subprocess_kwargs) if ok else {}
+    if cancel_check and cancel_check():
+        return False, "Installation cancelled"
+
+    packages = [str(name) for name in (marker.get("packages") or [])
+                if not str(name).lower().startswith(("spconv-", "cumm-"))]
+    if ok and not error:
+        packages.append(f"spconv-{build}")
+    fields = {key: value for key, value in marker.items() if key not in (
+        "install_schema_version", "plugin_version", "cuda_logic_version", "written_at")}
+    fields.update({
+        "packages": packages,
+        "spconv_version": next(iter(versions.values()), None) if not error else None,
+        "spconv_build": build,
+        "spconv_fallback": _spconv_is_fallback(marker.get("cuda_index")),
+        "spconv_error": error,
+    })
+    _write_install_marker(VENV_DIR, extra=fields)
+    if error:
+        _log(f"spconv-{build} could not be added: {error}", Qgis.MessageLevel.Warning)
+        return False, (
+            f"spconv-{build} could not be added to the environment: {error[:200]}. "
+            "Use Repair dependencies to try again (only spconv is downloaded), "
+            "or report the Setup log on the issue tracker."
+        )
+    report(100, "Environment completed")
+    _log(f"Added spconv-{build} {versions.get(f'spconv-{build}', '')} to the environment",
+         Qgis.MessageLevel.Success)
+    return True, "Virtual environment ready"
+
+
+def remove_venv(venv_dir: str = None) -> Tuple[bool, str]:
+    """Remove the virtual environment.
+
+    Args:
+        venv_dir: Optional venv directory path. Uses VENV_DIR if None.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if venv_dir is None:
+        venv_dir = VENV_DIR
+
+    if not os.path.exists(venv_dir):
+        return True, "Virtual environment does not exist"
+
+    try:
+        shutil.rmtree(venv_dir)
+        _log(f"Removed virtual environment: {venv_dir}", Qgis.MessageLevel.Success)
+        return True, "Virtual environment removed"
+    except Exception as e:
+        _log(f"Failed to remove venv: {e}", Qgis.MessageLevel.Warning)
+        return False, f"Failed to remove venv: {str(e)[:200]}"
+
+
+# ---------------------------------------------------------------------------
+# Full orchestration
+# ---------------------------------------------------------------------------
+
+
+def create_venv_and_install(
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    cuda_enabled: bool = False,
+) -> Tuple[bool, str]:
+    """Complete installation: download Python + uv + create venv + install.
+
+    Progress breakdown:
+    - 0-10%: Download Python standalone (~50MB)
+    - 10-13%: Download uv package installer (~15MB)
+    - 13-18%: Create virtual environment
+    - 18-95%: Install packages
+    - 95-100%: Verify installation
+
+    Args:
+        progress_callback: Optional function called with (percent, message).
+        cancel_check: Optional function returning True to cancel.
+        cuda_enabled: Whether to install CUDA-enabled PyTorch.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    from .python_manager import (
+        download_python_standalone,
+        get_python_full_version,
+        standalone_python_exists,
+    )
+    from .uv_manager import download_uv
+    from .uv_manager import uv_exists as _uv_exists
+
+    _log_system_info()
+    # Certificate verification remains enabled throughout the install.
+    _reset_tls_insecure_fallback()
+
+    # Early check: verify cache directory is writable
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        test_file = os.path.join(CACHE_DIR, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+    except OSError:
+        if os.environ.get("RAIL3D_CACHE_DIR") or os.environ.get(
+                "RAIL3D_VENV_DIR"):
+            hint = f"The RAIL3D_CACHE_DIR is set to: {CACHE_DIR}"
+        else:
+            hint = (
+                "Set the RAIL3D_CACHE_DIR environment variable to a "
+                "writable directory before launching QGIS.")
+        return False, f"Cannot write to installation directory: {CACHE_DIR}\n{hint}"
+
+    rosetta_warning = _check_rosetta_warning()
+    if rosetta_warning:
+        _log(rosetta_warning, Qgis.MessageLevel.Warning)
+
+    # Step 1: Download Python standalone (0-10%)
+    if not standalone_python_exists():
+        python_version = get_python_full_version()
+        _log(f"Downloading Python {python_version} standalone...", Qgis.MessageLevel.Info)
+
+        def python_progress(percent, msg):
+            if progress_callback:
+                progress_callback(int(percent * 0.10), msg)
+
+        success, msg = download_python_standalone(
+            progress_callback=python_progress,
+            cancel_check=cancel_check,
+        )
+
+        if not success:
+            if sys.platform == "win32":
+                qgis_python = _get_qgis_python()
+                if qgis_python:
+                    if sys.version_info < (3, 9):
+                        py_ver = "{}.{}.{}".format(
+                            sys.version_info.major,
+                            sys.version_info.minor,
+                            sys.version_info.micro,
+                        )
+                        return (
+                            False, "Python {} is too old. Please upgrade QGIS.".format(py_ver), )
+                    _log(
+                        "Standalone Python download failed, "
+                        "falling back to QGIS Python: {}".format(msg),
+                        Qgis.MessageLevel.Warning,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            10, "Using QGIS Python (fallback)...")
+                else:
+                    return False, f"Failed to download Python: {msg}"
+            elif sys.platform.startswith("linux"):
+                linux_python = _get_linux_system_python()
+                if linux_python:
+                    _log(
+                        "Standalone Python download failed, "
+                        "falling back to system Python: {}".format(msg),
+                        Qgis.MessageLevel.Warning,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            10, "Using system Python (fallback)...")
+                else:
+                    return False, ("Failed to download Python: {}\n"
+                                   "No suitable system Python found. Please ensure python3 "
+                                   "and python3-venv are installed "
+                                   "(e.g., sudo apt install python3-venv).").format(msg)
+            else:
+                return False, f"Failed to download Python: {msg}"
+
+        if cancel_check and cancel_check():
+            return False, "Installation cancelled"
+    else:
+        _log("Python standalone already installed", Qgis.MessageLevel.Info)
+        if progress_callback:
+            progress_callback(10, "Python standalone ready")
+
+    # Step 1b: Download uv package installer (10-13%)
+    if not _uv_exists():
+        _log("Downloading uv package installer...", Qgis.MessageLevel.Info)
+        if progress_callback:
+            progress_callback(10, "Downloading uv package installer...")
+
+        def uv_progress(percent, msg):
+            if progress_callback:
+                # Map 0-100 to 10-13
+                progress_callback(10 + int(percent * 0.03), msg)
+
+        uv_success, uv_msg = download_uv(
+            progress_callback=uv_progress,
+            cancel_check=cancel_check,
+        )
+        if not uv_success:
+            # Non-fatal: fall back to pip for venv creation and installation.
+            # spconv (LitePT-L on CUDA) needs uv: its attempt is recorded as
+            # failed, and Repair dependencies adds it later.
+            _log(
+                "uv download failed (will use pip instead; spconv for the model "
+                "needs uv and is added by Repair dependencies): {}".format(uv_msg),
+                Qgis.MessageLevel.Warning,
+            )
+        else:
+            _log("uv package installer ready", Qgis.MessageLevel.Info)
+
+        if cancel_check and cancel_check():
+            return False, "Installation cancelled"
+    else:
+        _log("uv package installer already installed", Qgis.MessageLevel.Info)
+        if progress_callback:
+            progress_callback(13, "uv package installer ready")
+
+    # Step 2: Create venv (13-18%)
+    if venv_exists():
+        _log("Virtual environment already exists", Qgis.MessageLevel.Info)
+        if progress_callback:
+            progress_callback(18, "Virtual environment ready")
+    else:
+        success, msg = create_venv(progress_callback=progress_callback)
+        if not success:
+            return False, msg
+
+        if cancel_check and cancel_check():
+            return False, "Installation cancelled"
+
+    # Step 3: Install dependencies (18-95%)
+    def deps_progress(percent, msg):
+        if progress_callback:
+            mapped = 18 + int((percent - 20) * 77 / 80)
+            progress_callback(min(mapped, 95), msg)
+
+    success, msg = install_dependencies(
+        progress_callback=deps_progress,
+        cancel_check=cancel_check,
+        cuda_enabled=cuda_enabled,
+    )
+
+    if not success:
+        return False, msg
+
+    # Which torch build ends up in the venv (recorded in the install
+    # marker) and therefore which spconv build must be verified with it.
+    torch_index_in_use: Optional[str] = None
+    if cuda_enabled:
+        _, _gpu_info_for_marker = detect_nvidia_gpu()
+        torch_index_in_use = _select_cuda_index(_gpu_info_for_marker)
+
+    # Step 4: Verify (95-100%)
+    def verify_progress(percent: int, msg: str):
+        if progress_callback:
+            mapped = 95 + int(percent * 0.04)
+            progress_callback(min(mapped, 99), msg)
+
+    spconv_fallback = _spconv_is_fallback(torch_index_in_use)
+    spconv_expected = _spconv_extra_for(torch_index_in_use)
+    is_valid, verify_msg = verify_venv(
+        progress_callback=verify_progress,
+        extra_packages=spconv_expected,
+        optional_packages=spconv_expected if spconv_fallback else None,
+    )
+
+    # Do not silently change the requested device or perform a long reinstall
+    # cascade after verification. The user can repair or choose CPU explicitly.
+    if is_valid and cuda_enabled:
+        if cancel_check and cancel_check():
+            return False, "Installation cancelled"
+        if not _verify_cuda_in_venv(VENV_DIR):
+            if _running_in_flatpak():
+                return False, (
+                    "PyTorch was installed but its GPU (CUDA) test failed inside "
+                    "the QGIS Flatpak. In a terminal, run 'flatpak update' (it "
+                    "installs the NVIDIA Flatpak driver matching the system "
+                    "driver) and 'sudo nvidia-modprobe -u -c=0' (it creates the "
+                    "CUDA device the sandbox needs), restart QGIS and click "
+                    "Reinstall Dependencies, or install the CPU version (button below).")
+            if _last_cuda_check.get("no_kernels_for"):
+                return False, (
+                    f"The installed PyTorch ({torch_index_in_use}) has no GPU code for this "
+                    f"GPU ({_last_cuda_check['no_kernels_for']}); a driver update does not "
+                    "change that. Please report the Setup log on the issue tracker; "
+                    "meanwhile install the CPU version (button below).")
+            return False, ("PyTorch was installed but its GPU (CUDA) test failed on this computer. Update the NVIDIA driver and click Reinstall Dependencies, or install the CPU version (button below).")
+
+    if not is_valid:
+        return False, f"Verification failed: {verify_msg}"
+
+    # The imports above prove the packages work for the venv's Python,
+    # not that they live in the venv QGIS will load them from. If they
+    # landed elsewhere (a leaked PYTHON* variable made uv target the base
+    # interpreter), QGIS could never import them: stop here instead of
+    # stamping the environment ready.
+    in_venv, where_msg = _quick_check_packages(VENV_DIR)
+    if not in_venv:
+        return False, (
+            "The packages were installed outside the plugin's environment "
+            f"({where_msg} in {get_venv_site_packages(VENV_DIR)}). Please "
+            "report this on the issue tracker with the Log Messages panel "
+            f"content ({PLUGIN_NAME} tab)."
+        )
+
+    if cancel_check and cancel_check():
+        return False, "Installation cancelled"
+    _write_deps_hash()
+
+    cuda_mode = "cuda" if cuda_enabled else "cpu"
+    _write_cuda_flag(cuda_mode)
+
+    # Stamp the venv only now: every required package imports. The extra fields
+    # record what was actually installed so later releases can add the
+    # packages a new model needs without rebuilding the whole venv.
+    final_versions = _get_installed_versions(
+        get_venv_python_path(VENV_DIR), ("torch", "torchvision"),
+        _get_clean_env_for_venv(), _get_subprocess_kwargs(),
+    )
+    spconv_names = spconv_expected if cuda_mode == "cuda" else []
+    spconv_versions = _get_installed_versions(
+        get_venv_python_path(VENV_DIR), spconv_names,
+        _get_clean_env_for_venv(), _get_subprocess_kwargs(),
+    ) if spconv_names else {}
+    if cancel_check and cancel_check():
+        return False, "Installation cancelled"
+    installed_spconv = [name for name in spconv_names if name in spconv_versions]
+    spconv_error = _last_spconv_result.get("error")
+    if spconv_names and not spconv_error and (
+            not installed_spconv or "optional packages unavailable" in verify_msg):
+        spconv_error = "the package was installed but failed to import (see the Setup log)"
+    _write_install_marker(VENV_DIR, extra={
+        "torch_version": final_versions.get("torch"),
+        "torchvision_version": final_versions.get("torchvision"),
+        "cuda_index": torch_index_in_use,
+        "cuda_mode": cuda_mode,
+        "packages": [name for name, _ in _get_required_packages()] + installed_spconv,
+        "spconv_version": next(iter(spconv_versions.values()), None),
+        # spconv build installed with this torch (None: CPU install or no
+        # build), whether it is the fallback build compiled by the driver
+        # (RTX 50 series), and why it is unusable when it is.
+        "spconv_build": _spconv_build_for(torch_index_in_use) if cuda_mode == "cuda" else None,
+        "spconv_fallback": bool(spconv_names) and spconv_fallback,
+        "spconv_error": spconv_error if spconv_names else None,
+        # QGIS's NumPy the packages were chosen for (None: no constraint).
+        "host_numpy": (_host_numpy_pin(VENV_DIR) or "==").split("==", 1)[1] or None,
+    })
+
+    removed_venvs = cleanup_old_venv_directories()
+    if removed_venvs:
+        _log(f"Removed {len(removed_venvs)} stale environment(s) of other Python versions",
+             Qgis.MessageLevel.Info)
+
+    if progress_callback:
+        progress_callback(100, "All dependencies installed and verified")
+
+    return True, "Virtual environment ready"

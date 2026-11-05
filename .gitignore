@@ -1,0 +1,12 @@
+dist/
+tools/logs/
+tools/gui_qgis3/
+tools/gui_qgis4/
+tools/fresh_install.log
+tools/icon_preview.png
+test_logs/
+__pycache__/
+*.pyc
+*.pth
+*.las
+*.laz

@@ -1,0 +1,120 @@
+plugin extracted from C:\Users\user\Desktop\QGIS_Plugin\futurail\Rail3D\dist\Rail_3D_v1.0.0.zip
+launch: cmd /c C:\Users\user\qgis4_test\app\bin\qgis.bat --profiles-path C:\Users\user\Desktop\QGIS_Plugin\futurail\tools\gui_qgis4 --noversioncheck --nologo --code C:\Users\user\Desktop\QGIS_Plugin\futurail\tools\gui_run.py
+first launch: enabled
+launch: cmd /c C:\Users\user\qgis4_test\app\bin\qgis.bat --profiles-path C:\Users\user\Desktop\QGIS_Plugin\futurail\tools\gui_qgis4 --noversioncheck --nologo --code C:\Users\user\Desktop\QGIS_Plugin\futurail\tools\gui_run.py
+W1105 13:36:34.423000 35644 torch\fx\_symbolic_trace.py:57] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+{
+  "t0": 1793882139.7381988,
+  "steps": [
+    "10.3s screenshot setup_panel.png",
+    "16.4s screenshot plugin_manager_zip.png",
+    "37.8s screenshot panel_empty.png",
+    "37.9s screenshot qgis_window_panel.png",
+    "39.5s screenshot codes_dialog.png",
+    "44.0s screenshot panel_ready.png",
+    "44.1s run started",
+    "59.2s screenshot panel_running.png",
+    "71.2s run finished",
+    "79.3s screenshot panel_done.png",
+    "79.3s screenshot map_result.png",
+    "79.5s screenshot qgis_window_result.png"
+  ],
+  "stage": "drive",
+  "plugin_loaded": true,
+  "qgis": "4.2.2-Bel\u00e9m do Par\u00e1",
+  "setup_gpu_text": "GPU detected: NVIDIA GeForce RTX 3090 (24576 MB)\nThe GPU (CUDA) version will be installed.",
+  "plugin_manager": "Plugins | Install from ZIP",
+  "plugin_version": "1.0.0",
+  "model_name": "Railway classifier",
+  "initial_label": "<span style='color:#2e7d32;'>\u25cf</span> Ready",
+  "device": "GPU: RTX 3090",
+  "gpu_checked": true,
+  "gate_ok": true,
+  "weights_ready": true,
+  "hint": "Add LAS / LAZ / COPC files to the list above.",
+  "field_enabled": false,
+  "codes_row_visible": true,
+  "codes_dialog": {
+    "title": "Railway model output class codes",
+    "rows": 7,
+    "defaults": [
+      [
+        "1",
+        "Ground",
+        "2",
+        "Ground"
+      ],
+      [
+        "2",
+        "Rail",
+        "10",
+        "Rail"
+      ],
+      [
+        "3",
+        "Pole",
+        "15",
+        "Transmission tower"
+      ],
+      [
+        "4",
+        "Wire",
+        "14",
+        "Wire conductor (phase)"
+      ],
+      [
+        "5",
+        "Vegetation",
+        "5",
+        "High vegetation"
+      ],
+      [
+        "6",
+        "Fence",
+        "64",
+        "User definable"
+      ],
+      [
+        "7",
+        "Other",
+        "1",
+        "Unclassified"
+      ]
+    ]
+  },
+  "run_enabled": true,
+  "hint_before_run": "Ready: 1 file(s), Railway classifier on GPU (CUDA).",
+  "started_at": 44.1,
+  "progress_texts": [
+    "Starting classification...",
+    "Processing: rail_crop.laz (1/1)"
+  ],
+  "settled": true,
+  "seconds": 19.1,
+  "status": "Classification complete: 1 file(s) in 18 s.",
+  "outputs": [
+    "rail_crop_classified.copc.laz",
+    "rail_crop_classified.laz"
+  ],
+  "layers": [
+    {
+      "name": "rail_crop_classified",
+      "valid": true,
+      "points": 2397825,
+      "renderer": "classified"
+    }
+  ],
+  "elapsed": 79.5
+}
+log tail:
+[13:36:23] Starting the Railway classifier (Rail 3D railway model (5 cm)) on CUDA with 1 file(s)
+[13:36:23] Output: C:\Users\user\Desktop\QGIS_Plugin\futurail\tools\gui_qgis4\out\classified - suffix: _classified - field: classification (ASPRS-standard)
+[13:36:23] Railway model output codes: {"1": 2, "2": 10, "3": 15, "4": 14, "5": 5, "6": 64, "7": 1}
+[13:36:23] Model: Rail 3D railway model (5 cm) on CUDA
+[13:36:32] CUDA memory: PyTorch's standard allocator (automatic choice on Windows, where expandable segments fail with some GPU drivers). The mode can be fixed in the dock, Advanced parameters > GPU memory allocator.
+[13:36:33] Processing rail_crop.laz (1/1)
+[13:36:33] rail_crop.laz: coordinate units: metres (no CRS in the LAS header; metres assumed)
+[13:36:41] Classification complete: 1 file(s) in 18 s
+[13:36:41] 3D rendering enabled for layer 'rail_crop_classified'
+[13:36:41] Loaded layer: rail_crop_classified (rail_crop_classified.laz)
+exit 0

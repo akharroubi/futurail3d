@@ -1,0 +1,39 @@
+[general]
+name=Rail 3D
+qgisMinimumVersion=3.34
+qgisMaximumVersion=4.99
+description=Classify railway LiDAR point clouds (ground, rail, pole, wire, vegetation, fence) with a deep-learning model.
+version=1.0.0
+author=Abderrazzaq Kharroubi (GeoScITY Lab, University of Liege)
+email=akharroubi2@gmail.com
+license=GPL-3.0-or-later
+
+about=Classifies railway corridor LiDAR point clouds (LAS / LAZ / COPC)
+    with a deep-learning model at 5 cm, using XYZ only. Seven classes:
+    ground (track bed and platforms), rail, pole (catenary masts,
+    portals and supports), wire, vegetation, fence and other. Every
+    output code is editable; the defaults follow the ASPRS LAS 1.4
+    table where a class exists. The model weights ship with the plugin.
+    A one-click setup installs PyTorch and the LiDAR packages into a
+    separate per-user folder on first use (no admin rights). Files in
+    feet are converted from their CRS; tiling and streaming handle
+    files larger than RAM. Requires an NVIDIA GPU with a current driver.
+
+tracker=https://github.com/akharroubi/futurail3d/issues
+repository=https://github.com/akharroubi/futurail3d
+homepage=https://github.com/akharroubi/futurail3d
+
+tags=lidar,point cloud,classification,deep learning,railway,rail,catenary,las,laz,copc
+
+category=Analysis
+icon=icon.png
+
+experimental=False
+deprecated=False
+hasProcessingProvider=yes
+server=False
+
+changelog=
+    1.0.0
+        - First delivery: railway classifier, editable output codes,
+          one-click setup, tiling and streaming, Processing algorithm.
