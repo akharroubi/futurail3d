@@ -1,6 +1,0 @@
-Work directory: E:\alc_test\rail3d_e2e\qgis_e2e_h4wzz7y7
-qgis3 {"launcher": "C:\\Program Files\\QGIS 3.44.10\\bin\\qgis_process-qgis-ltr.bat", "log": "E:\\alc_test\\rail3d_e2e\\qgis_e2e_h4wzz7y7\\qgis3.log", "algorithm": "rail3d:classify_point_cloud", "codes": "default", "exit_code": 0, "seconds": 34.6, "weights_source": "bundled", "profile_model_files": [], "output": "E:\\alc_test\\rail3d_e2e\\qgis_e2e_h4wzz7y7\\out_qgis3\\rail_e2e_input_classified.laz", "points": 2397825, "problems": []}
-qgis4 {"launcher": "C:\\Users\\user\\qgis4_test\\app\\bin\\qgis_process-qgis.bat", "log": "E:\\alc_test\\rail3d_e2e\\qgis_e2e_h4wzz7y7\\qgis4.log", "algorithm": "rail3d:classify_point_cloud", "codes": "custom", "exit_code": 0, "seconds": 33.0, "weights_source": "bundled", "profile_model_files": [], "output": "E:\\alc_test\\rail3d_e2e\\qgis_e2e_h4wzz7y7\\out_qgis4\\rail_e2e_input_classified.laz", "points": 2397825, "problems": []}
-Report: E:\alc_test\rail3d_e2e\qgis_e2e_h4wzz7y7\e2e_report.json
-E2E PASSED
-exit 0
